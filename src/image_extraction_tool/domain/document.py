@@ -81,6 +81,10 @@ class ImageDocument:
         pixel = self._original_rgba.getpixel((x, y))
         return int(pixel[0]), int(pixel[1]), int(pixel[2]), int(pixel[3])
 
+    def original_bytes(self) -> bytes:
+        """返回按行排列的 RGBA 字节数据，每个像素连续占 4 字节。"""
+        return self._original_rgba.tobytes("raw", "RGBA")
+
     def add_selected_colors(self, colors: Sequence[SelectedColor]) -> list[SelectedColor]:
         """按 RGB 去重添加颜色并返回实际新增项。"""
         existing = {selected.rgb for selected in self.selected_colors}

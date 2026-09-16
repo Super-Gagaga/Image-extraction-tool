@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from math import floor
 from pathlib import Path
 
 from PIL import Image
 from PySide6.QtCore import QPointF, QRectF, QThread, Qt, Signal
 from PySide6.QtGui import QAction, QActionGroup, QCloseEvent, QDragEnterEvent, QDropEvent, QKeySequence
-from PySide6.QtWidgets import QFileDialog, QLabel, QMainWindow, QMessageBox, QSpinBox
+from PySide6.QtWidgets import QFileDialog, QLabel, QMainWindow, QMessageBox, QProgressBar, QSpinBox
 
 from image_extraction_tool.application.command_stack import (
     ApplyAiMaskCommand,
@@ -20,12 +21,16 @@ from image_extraction_tool.application.command_stack import (
     MaskPatchCommand,
 )
 from image_extraction_tool.application.export_task import ExportWorker
+from image_extraction_tool.application.segmentation_task import SegmentationWorker
 from image_extraction_tool.domain.brush import BrushSettings, brush_segment_bounds, paint_mask_segment
 from image_extraction_tool.domain.color_selection import SelectedColor, build_color_mask, representative_colors
 from image_extraction_tool.domain.compositor import compose_result
 from image_extraction_tool.domain.document import ImageDocument, ToolType
-from image_extraction_tool.errors import ImageLoadError
+from image_extraction_tool.domain.segmentation import CancelToken, Segmenter
+from image_extraction_tool.errors import ImageLoadError, ModelMissingError
 from image_extraction_tool.infrastructure.image_io import SUPPORTED_EXTENSIONS, load_image
+from image_extraction_tool.infrastructure.model_store import ModelStore
+from image_extraction_tool.infrastructure.segmenters import OnnxU2NetSegmenter
 from image_extraction_tool.ui.canvas_view import CanvasView
 from image_extraction_tool.ui.color_panel import ColorPanel
 
@@ -36,13 +41,27 @@ class MainWindow(QMainWindow):
     # 供测试与外部集成等待导出结果；成功携带路径，失败携带错误文案
     export_finished = Signal(object)
     export_failed = Signal(str)
+    segmentation_finished = Signal(object)
+    segmentation_cancelled = Signal()
+    segmentation_failed = Signal(str)
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        model_store: ModelStore | None = None,
+        segmenter_factory: Callable[[Path], Segmenter] | None = None,
+    ) -> None:
         super().__init__()
         self.document: ImageDocument | None = None
         # 导出任务运行期间非空，用于防止重复启动并在关闭窗口时等待线程收尾
         self._export_thread: QThread | None = None
         self._export_worker: ExportWorker | None = None
+        self._segmentation_thread: QThread | None = None
+        self._segmentation_worker: SegmentationWorker | None = None
+        self._segmentation_token: CancelToken | None = None
+        self._segmentation_document: ImageDocument | None = None
+        self._model_store = model_store or ModelStore()
+        self._segmenter_factory = segmenter_factory or (lambda path: OnnxU2NetSegmenter(path))
         self._active_tool = ToolType.NONE
         self.history = CommandStack(max_commands=100, max_bytes=256 * 1024 * 1024)
         self._stroke_recorder: BrushStrokeRecorder | None = None
@@ -58,10 +77,18 @@ class MainWindow(QMainWindow):
         self._size_label = QLabel("未加载图片")
         self._zoom_label = QLabel("—")
         self._tool_label = QLabel("工具：无")
+        self._model_label = QLabel("模型：未运行")
+        self._model_progress = QProgressBar()
+        self._model_progress.setObjectName("segmentationProgressBar")
+        self._model_progress.setRange(0, 100)
+        self._model_progress.setFixedWidth(150)
+        self._model_progress.hide()
         # 尺寸、缩放与当前工具常驻状态栏右侧，加载提示显示在左侧
         self.statusBar().addPermanentWidget(self._size_label)
         self.statusBar().addPermanentWidget(self._zoom_label)
         self.statusBar().addPermanentWidget(self._tool_label)
+        self.statusBar().addPermanentWidget(self._model_label)
+        self.statusBar().addPermanentWidget(self._model_progress)
         self.statusBar().showMessage("可打开或拖入 PNG、JPG、JPEG、WEBP 图片")
 
         self._create_actions()
@@ -84,6 +111,23 @@ class MainWindow(QMainWindow):
         self.export_action.setEnabled(False)
         self.export_action.triggered.connect(self.export_dialog)
         toolbar.addAction(self.export_action)
+
+        self.smart_cut_action = QAction("智能抠图", self)
+        self.smart_cut_action.setObjectName("smartCutAction")
+        self.smart_cut_action.setEnabled(False)
+        self.smart_cut_action.triggered.connect(self.start_segmentation)
+        toolbar.addAction(self.smart_cut_action)
+
+        self.cancel_segmentation_action = QAction("取消智能抠图", self)
+        self.cancel_segmentation_action.setObjectName("cancelSegmentationAction")
+        self.cancel_segmentation_action.setEnabled(False)
+        self.cancel_segmentation_action.triggered.connect(self.cancel_segmentation)
+        toolbar.addAction(self.cancel_segmentation_action)
+
+        self.select_model_action = QAction("选择模型", self)
+        self.select_model_action.setObjectName("selectModelAction")
+        self.select_model_action.triggered.connect(self.select_model_dialog)
+        toolbar.addAction(self.select_model_action)
 
         self.undo_action = QAction("撤销", self)
         self.undo_action.setObjectName("undoAction")
@@ -204,6 +248,8 @@ class MainWindow(QMainWindow):
 
         返回是否加载成功，供拖放事件决定是否接受该操作。
         """
+        if self._segmentation_thread is not None:
+            return False
         try:
             new_document = load_image(path)
         except ImageLoadError as exc:
@@ -221,6 +267,7 @@ class MainWindow(QMainWindow):
         self.fit_action.setEnabled(True)
         self.actual_size_action.setEnabled(True)
         self.export_action.setEnabled(True)
+        self.smart_cut_action.setEnabled(True)
         self.color_panel.set_tolerance(new_document.color_tolerance)
         self.color_panel.set_colors(new_document.selected_colors)
         self._set_editing_enabled(True)
@@ -489,6 +536,129 @@ class MainWindow(QMainWindow):
         self._push_history(command)
         self._sync_document_to_ui()
 
+    def select_model_dialog(self) -> None:
+        """选择本地 ONNX 模型；不会复制或上传模型文件。"""
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择本地抠图模型",
+            str(self._model_store.model_path.parent),
+            "ONNX 模型 (*.onnx)",
+        )
+        if not path:
+            return
+        try:
+            self._model_store.select(path)
+        except ModelMissingError as exc:
+            QMessageBox.warning(self, "模型不可用", str(exc))
+            return
+        self._model_label.setText(f"模型：{Path(path).name}")
+        self.statusBar().showMessage("已选择本地模型", 3000)
+
+    def start_segmentation(self) -> bool:
+        """在独立线程中加载模型并对不可变原图副本执行智能抠图。"""
+        if self.document is None or self._segmentation_thread is not None or self._export_thread is not None:
+            return False
+        try:
+            model_path = self._model_store.require_model()
+        except ModelMissingError as exc:
+            QMessageBox.warning(self, "缺少智能抠图模型", str(exc))
+            self._model_label.setText("模型：文件缺失")
+            return False
+
+        token = CancelToken()
+        segmenter = self._segmenter_factory(model_path)
+        worker = SegmentationWorker(segmenter, self.document.original_rgba, token)
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._segmentation_progress)
+        worker.succeeded.connect(self._segmentation_succeeded)
+        worker.cancelled.connect(self._segmentation_was_cancelled)
+        worker.failed.connect(self._segmentation_failed)
+        for signal in (worker.succeeded, worker.cancelled, worker.failed):
+            signal.connect(thread.quit)
+            signal.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._segmentation_thread_finished)
+
+        self._segmentation_thread = thread
+        self._segmentation_worker = worker
+        self._segmentation_token = token
+        self._segmentation_document = self.document
+        self._set_segmentation_busy(True)
+        thread.start()
+        return True
+
+    def cancel_segmentation(self) -> None:
+        """请求协作式取消；工作线程不会再把结果提交给当前文档。"""
+        if self._segmentation_token is None:
+            return
+        self._segmentation_token.cancel()
+        self.cancel_segmentation_action.setEnabled(False)
+        self._model_label.setText("模型：正在取消…")
+
+    def _segmentation_progress(self, value: int, message: str) -> None:
+        self._model_progress.setValue(min(max(value, 0), 100))
+        self._model_label.setText(f"模型：{message}")
+
+    def _segmentation_succeeded(self, mask: Image.Image) -> None:
+        token = self._segmentation_token
+        if token is not None and token.is_cancelled:
+            self._segmentation_was_cancelled()
+            return
+        if self.document is not self._segmentation_document:
+            self._segmentation_failed("图片已发生变化，智能抠图结果未应用")
+            return
+        try:
+            self.apply_ai_mask(mask)
+        except (RuntimeError, ValueError) as exc:
+            self._segmentation_failed(str(exc))
+            return
+        self._model_label.setText("模型：完成")
+        self.segmentation_finished.emit(mask)
+
+    def _segmentation_was_cancelled(self) -> None:
+        self._model_label.setText("模型：已取消")
+        self.segmentation_cancelled.emit()
+
+    def _segmentation_failed(self, message: str) -> None:
+        self._model_label.setText("模型：失败")
+        QMessageBox.warning(self, "智能抠图失败", message)
+        self.segmentation_failed.emit(message)
+
+    def _set_segmentation_busy(self, busy: bool) -> None:
+        has_document = self.document is not None
+        self.open_action.setEnabled(not busy)
+        self.select_model_action.setEnabled(not busy)
+        self.smart_cut_action.setEnabled(has_document and not busy)
+        self.cancel_segmentation_action.setEnabled(busy)
+        self.export_action.setEnabled(has_document and not busy)
+        self._set_editing_enabled(has_document and not busy)
+        self._model_progress.setVisible(busy)
+        if busy:
+            self.undo_action.setEnabled(False)
+            self.redo_action.setEnabled(False)
+            self._model_progress.setValue(0)
+            self._set_active_tool(ToolType.NONE)
+        else:
+            self._update_history_actions()
+            self._restore_checked_tool()
+
+    def _restore_checked_tool(self) -> None:
+        if self.color_picker_action.isChecked():
+            self._set_active_tool(ToolType.COLOR_PICKER)
+        elif self.erase_action.isChecked():
+            self._set_active_tool(ToolType.ERASE_BRUSH)
+        elif self.restore_action.isChecked():
+            self._set_active_tool(ToolType.RESTORE_BRUSH)
+
+    def _segmentation_thread_finished(self) -> None:
+        self._segmentation_thread = None
+        self._segmentation_worker = None
+        self._segmentation_token = None
+        self._segmentation_document = None
+        self._set_segmentation_busy(False)
+
     def _push_history(self, command: HistoryCommand) -> None:
         """记录已成功应用的命令并同步动作状态。"""
         self.history.push_applied(command)
@@ -524,7 +694,7 @@ class MainWindow(QMainWindow):
         self.canvas.update_image(compose_result(self.document))
 
     def _update_history_actions(self) -> None:
-        enabled = self.document is not None and self._export_thread is None
+        enabled = self.document is not None and self._export_thread is None and self._segmentation_thread is None
         self.undo_action.setEnabled(enabled and self.history.can_undo)
         self.redo_action.setEnabled(enabled and self.history.can_redo)
         undo_name = self.history.undo_description
@@ -546,10 +716,13 @@ class MainWindow(QMainWindow):
 
     def start_export(self, destination: Path) -> bool:
         """启动非阻塞全尺寸导出；已有任务运行时拒绝重复启动。"""
-        if self.document is None or self._export_thread is not None:
+        if self.document is None or self._export_thread is not None or self._segmentation_thread is not None:
             return False
         # 导出期间冻结编辑入口，避免合成读到的蒙版被同时修改
         self._set_editing_enabled(False)
+        self.open_action.setEnabled(False)
+        self.smart_cut_action.setEnabled(False)
+        self.select_model_action.setEnabled(False)
         self.export_action.setEnabled(False)
         self.undo_action.setEnabled(False)
         self.redo_action.setEnabled(False)
@@ -590,22 +763,25 @@ class MainWindow(QMainWindow):
         self._export_thread = None
         self._export_worker = None
         has_document = self.document is not None
+        self.open_action.setEnabled(True)
+        self.select_model_action.setEnabled(True)
+        self.smart_cut_action.setEnabled(has_document)
         self._set_editing_enabled(has_document)
         self.export_action.setEnabled(has_document)
         self._update_history_actions()
         # 恢复导出前选中的画笔工具
-        if self.color_picker_action.isChecked():
-            self._set_active_tool(ToolType.COLOR_PICKER)
-        elif self.erase_action.isChecked():
-            self._set_active_tool(ToolType.ERASE_BRUSH)
-        elif self.restore_action.isChecked():
-            self._set_active_tool(ToolType.RESTORE_BRUSH)
+        self._restore_checked_tool()
 
     def closeEvent(self, event: QCloseEvent) -> None:
         """关闭窗口前等待导出线程结束，避免进程退出时线程仍在使用文档。"""
         if self._export_thread is not None:
             self._export_thread.quit()
             self._export_thread.wait()
+        if self._segmentation_token is not None:
+            self._segmentation_token.cancel()
+        if self._segmentation_thread is not None:
+            self._segmentation_thread.quit()
+            self._segmentation_thread.wait()
         super().closeEvent(event)
 
     def _update_zoom(self, scale: float) -> None:
