@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum, auto
 from pathlib import Path
 
 from PIL import Image
+
+from image_extraction_tool.domain.color_selection import SelectedColor
 
 
 class ToolType(Enum):
@@ -48,9 +51,9 @@ class ImageDocument:
     def __init__(self, original_rgba: Image.Image, source_path: Path | None = None) -> None:
         # 统一按 RGBA 处理，保证后续蒙版与导出逻辑不依赖原始色彩模式
         if original_rgba.mode != "RGBA":
-            raise ValueError("original_rgba must use RGBA mode")
+            raise ValueError("original_rgba 必须使用 RGBA 模式")
         if original_rgba.width < 1 or original_rgba.height < 1:
-            raise ValueError("original_rgba must not be empty")
+            raise ValueError("original_rgba 尺寸不能为空")
 
         self.source_path = source_path
         self._original_rgba = original_rgba.copy()
@@ -59,6 +62,8 @@ class ImageDocument:
         self.color_mask = Image.new("L", self._original_rgba.size, 255)
         self.erase_mask = Image.new("L", self._original_rgba.size, 0)
         self.restore_mask = Image.new("L", self._original_rgba.size, 0)
+        self.selected_colors: list[SelectedColor] = []
+        self.color_tolerance = 30
         # 每次修改蒙版后自增，供 UI 判断是否需要重绘缓存
         self.revision = 0
 
@@ -70,6 +75,28 @@ class ImageDocument:
     @property
     def size(self) -> tuple[int, int]:
         return self._original_rgba.size
+
+    def original_pixel(self, x: int, y: int) -> tuple[int, int, int, int]:
+        """读取不可变原图的一个 RGBA 像素，不暴露内部图像对象。"""
+        pixel = self._original_rgba.getpixel((x, y))
+        return int(pixel[0]), int(pixel[1]), int(pixel[2]), int(pixel[3])
+
+    def add_selected_colors(self, colors: Sequence[SelectedColor]) -> list[SelectedColor]:
+        """按 RGB 去重添加颜色并返回实际新增项。"""
+        existing = {selected.rgb for selected in self.selected_colors}
+        added: list[SelectedColor] = []
+        for selected in colors:
+            if selected.rgb not in existing:
+                self.selected_colors.append(selected)
+                existing.add(selected.rgb)
+                added.append(selected)
+        return added
+
+    def clear_color_selection(self) -> None:
+        """只清空颜色选择与颜色蒙版，不改变两张画笔蒙版。"""
+        self.selected_colors.clear()
+        self.color_mask.paste(255, (0, 0, *self.size))
+        self.revision += 1
 
     def clear_brush_masks(self) -> None:
         """只清空抠除与恢复画笔，不改变 AI 或颜色蒙版。

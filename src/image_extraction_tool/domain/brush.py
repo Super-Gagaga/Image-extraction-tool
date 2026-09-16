@@ -52,6 +52,24 @@ def interpolated_points(start: Point, end: Point, size_px: int) -> list[Point]:
     ]
 
 
+def brush_segment_bounds(
+    image_size: tuple[int, int],
+    start: Point,
+    end: Point,
+    size_px: int,
+) -> BoundingBox | None:
+    """返回画段可能修改的、裁剪到原图范围内的矩形。"""
+    width, height = image_size
+    radius = 0.5 if size_px == 1 else size_px / 2.0
+    left = max(0, floor(min(start[0], end[0]) - radius))
+    top = max(0, floor(min(start[1], end[1]) - radius))
+    right = min(width, ceil(max(start[0], end[0]) + radius))
+    bottom = min(height, ceil(max(start[1], end[1]) + radius))
+    if left >= right or top >= bottom:
+        return None
+    return left, top, right, bottom
+
+
 def paint_mask_segment(
     mask: Image.Image,
     start: Point,
@@ -65,7 +83,7 @@ def paint_mask_segment(
     返回 None 表示没有任何像素被修改（笔迹完全落在蒙版之外或透明度为 0）。
     """
     if mask.mode != "L":
-        raise ValueError("brush mask must use L mode")
+        raise ValueError("画笔蒙版必须使用 L 模式")
     if settings.opacity <= 0:
         return None
 

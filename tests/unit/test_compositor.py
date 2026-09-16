@@ -42,3 +42,31 @@ def test_clear_brush_masks_does_not_change_ai_or_color_masks() -> None:
     assert document.color_mask.getpixel((0, 0)) == 34
     assert document.erase_mask.getextrema() == (0, 0)
     assert document.restore_mask.getextrema() == (0, 0)
+
+
+def test_color_and_any_brush_coverage_export_as_fully_transparent_pixels() -> None:
+    """颜色区域与非零画笔区域取并集，命中像素必须是 Alpha 0。"""
+    source = Image.new("RGBA", (4, 1))
+    source.putdata(
+        [
+            (10, 20, 30, 40),
+            (50, 60, 70, 80),
+            (90, 100, 110, 200),
+            (120, 130, 140, 255),
+        ]
+    )
+    document = ImageDocument(source)
+    document.color_mask.putpixel((0, 0), 0)
+    document.erase_mask.putpixel((1, 0), 1)
+    document.erase_mask.putpixel((2, 0), 127)
+    document.restore_mask.putpixel((2, 0), 1)
+
+    result = compose_result(document)
+
+    assert [result.getpixel((x, 0))[3] for x in range(4)] == [0, 0, 200, 255]
+    assert [result.getpixel((x, 0))[:3] for x in range(4)] == [
+        (10, 20, 30),
+        (50, 60, 70),
+        (90, 100, 110),
+        (120, 130, 140),
+    ]

@@ -21,7 +21,7 @@ def canvas_to_image(
         raise ValueError("scale 必须为正数")
     width, height = image_size
     if width < 1 or height < 1:
-        raise ValueError("image_size must be positive")
+        raise ValueError("image_size 必须为正数")
     image_x = (canvas_x - offset_x) / scale
     image_y = (canvas_y - offset_y) / scale
     # 夹取到 [0, 尺寸-1]，越界时贴到最近的有效像素

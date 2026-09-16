@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from PIL import Image
-from PySide6.QtCore import QPoint, QPointF, Qt, Signal
+from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, QRectF, Qt, Signal
 from PySide6.QtGui import (
     QBrush,
     QColor,
@@ -13,7 +13,9 @@ from PySide6.QtGui import (
     QPixmap,
     QWheelEvent,
 )
-from PySide6.QtWidgets import QGraphicsPixmapItem, QGraphicsScene, QGraphicsView
+from PySide6.QtWidgets import QGraphicsPixmapItem, QGraphicsScene, QGraphicsView, QRubberBand
+
+from image_extraction_tool.domain.document import ToolType
 
 
 # 缩放上下限，避免极端缩放下出现数值问题
@@ -41,7 +43,12 @@ class CanvasView(QGraphicsView):
     zoom_changed = Signal(float)
     # 画笔事件用 object 传递 QPointF：(起点, 终点) 表示一段笔迹
     brush_segment = Signal(object, object)
+    brush_started = Signal()
     brush_finished = Signal()
+    brush_cancelled = Signal()
+    color_point_selected = Signal(object)
+    color_region_selected = Signal(object)
+    hover_position_changed = Signal(object)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -49,8 +56,9 @@ class CanvasView(QGraphicsView):
         self._scene = QGraphicsScene(self)
         self.setScene(self._scene)
         self._image_item = QGraphicsPixmapItem()
-        # 缩放时使用平滑插值，避免像素化锯齿
-        self._image_item.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
+        # 使用最近邻显示：放大时每个画布色块都对应一个原图像素，
+        # 不在相邻像素之间生成导出结果中不存在的平滑颜色。
+        self._image_item.setTransformationMode(Qt.TransformationMode.FastTransformation)
         self._scene.addItem(self._image_item)
         self._has_image = False
         self._panning = False
@@ -59,14 +67,19 @@ class CanvasView(QGraphicsView):
         self._active_tool = None
         self._brushing = False
         self._brush_last_position: QPointF | None = None
+        self._selecting_color = False
+        self._selection_origin = QPoint()
+        self._selection_band = QRubberBand(QRubberBand.Shape.Rectangle, self.viewport())
 
         self.setBackgroundBrush(self._checkerboard_brush())
         self.setFrameShape(QGraphicsView.Shape.NoFrame)
-        self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
         # 缩放锚点交给 wheelEvent 手动计算，保持指针下的像素不动
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.NoAnchor)
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.NoAnchor)
         self.setDragMode(QGraphicsView.DragMode.NoDrag)
+        self.setMouseTracking(True)
+        self.viewport().setMouseTracking(True)
 
     @staticmethod
     def _checkerboard_brush() -> QBrush:
@@ -107,9 +120,20 @@ class CanvasView(QGraphicsView):
         self._image_item.setPixmap(pixmap)
         self._scene.setSceneRect(0.0, 0.0, float(pixmap.width()), float(pixmap.height()))
 
-    def set_active_tool(self, tool) -> None:
-        """设置当前左键工具；具体枚举由窗口层管理，避免画布依赖文档模型。"""
+    def set_active_tool(self, tool: ToolType | None) -> None:
+        """设置互斥左键工具，并取消尚未结束的旧工具操作。"""
+        self.cancel_current_operation()
         self._active_tool = tool
+
+    def cancel_current_operation(self) -> None:
+        """取消尚未完成的笔画或颜色框选。"""
+        was_brushing = self._brushing
+        self._brushing = False
+        self._brush_last_position = None
+        self._selecting_color = False
+        self._selection_band.hide()
+        if was_brushing:
+            self.brush_cancelled.emit()
 
     def _editable_scene_position(self, event: QMouseEvent) -> QPointF | None:
         """返回事件对应的原图坐标；落在图片之外时返回 None。
@@ -173,11 +197,24 @@ class CanvasView(QGraphicsView):
             self.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
             event.accept()
             return
-        if event.button() == Qt.MouseButton.LeftButton and self._has_image and self._active_tool is not None:
+        if event.button() == Qt.MouseButton.LeftButton and self._has_image and self._active_tool is ToolType.COLOR_PICKER:
+            position = self._editable_scene_position(event)
+            if position is not None:
+                self._selecting_color = True
+                self._selection_origin = event.position().toPoint()
+                self._selection_band.setGeometry(QRect(self._selection_origin, self._selection_origin))
+                self._selection_band.show()
+                event.accept()
+                return
+        if event.button() == Qt.MouseButton.LeftButton and self._has_image and self._active_tool in (
+            ToolType.ERASE_BRUSH,
+            ToolType.RESTORE_BRUSH,
+        ):
             position = self._editable_scene_position(event)
             if position is not None:
                 self._brushing = True
                 self._brush_last_position = position
+                self.brush_started.emit()
                 # 起点与终点相同即单点笔迹，使单击也能落笔
                 self.brush_segment.emit(position, position)
                 event.accept()
@@ -186,6 +223,8 @@ class CanvasView(QGraphicsView):
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         """平移时按拖动增量滚动滚动条；绘画时按上一位置到当前位置发出笔迹。"""
+        hover_position = self._editable_scene_position(event)
+        self.hover_position_changed.emit(hover_position)
         if self._panning:
             current = event.position().toPoint()
             delta = current - self._pan_origin
@@ -193,6 +232,11 @@ class CanvasView(QGraphicsView):
             # 反向滚动使画面跟随鼠标移动方向
             self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - delta.x())
             self.verticalScrollBar().setValue(self.verticalScrollBar().value() - delta.y())
+            event.accept()
+            return
+        if self._selecting_color:
+            selection = QRect(self._selection_origin, event.position().toPoint()).normalized()
+            self._selection_band.setGeometry(selection)
             event.accept()
             return
         if self._brushing:
@@ -218,6 +262,21 @@ class CanvasView(QGraphicsView):
             self.viewport().unsetCursor()
             event.accept()
             return
+        if event.button() == Qt.MouseButton.LeftButton and self._selecting_color:
+            release_position = event.position().toPoint()
+            viewport_rect = QRect(self._selection_origin, release_position).normalized()
+            self._selection_band.hide()
+            self._selecting_color = False
+            if viewport_rect.width() <= 3 and viewport_rect.height() <= 3:
+                self.color_point_selected.emit(self.mapToScene(self._selection_origin))
+            else:
+                scene_start = self.mapToScene(self._selection_origin)
+                scene_end = self.mapToScene(release_position)
+                region = QRectF(scene_start, scene_end).normalized().intersected(self._image_item.boundingRect())
+                if region.width() > 0 and region.height() > 0:
+                    self.color_region_selected.emit(region)
+            event.accept()
+            return
         if event.button() == Qt.MouseButton.LeftButton and self._brushing:
             # 松开前再画一次，覆盖快速拖动时最后一段来不及处理的距离
             position = self._editable_scene_position(event)
@@ -230,6 +289,10 @@ class CanvasView(QGraphicsView):
             event.accept()
             return
         super().mouseReleaseEvent(event)
+
+    def leaveEvent(self, event: QEvent) -> None:
+        self.hover_position_changed.emit(None)
+        super().leaveEvent(event)
 
     def _emit_zoom(self) -> None:
         """把当前缩放倍数广播给状态栏等订阅者。"""

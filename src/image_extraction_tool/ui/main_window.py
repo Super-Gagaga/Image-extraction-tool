@@ -2,19 +2,32 @@
 
 from __future__ import annotations
 
+from math import floor
 from pathlib import Path
 
-from PySide6.QtCore import QThread, Qt, Signal
+from PIL import Image
+from PySide6.QtCore import QPointF, QRectF, QThread, Qt, Signal
 from PySide6.QtGui import QAction, QActionGroup, QCloseEvent, QDragEnterEvent, QDropEvent, QKeySequence
 from PySide6.QtWidgets import QFileDialog, QLabel, QMainWindow, QMessageBox, QSpinBox
 
+from image_extraction_tool.application.command_stack import (
+    ApplyAiMaskCommand,
+    BrushStrokeRecorder,
+    ColorStateCommand,
+    CommandStack,
+    CompoundCommand,
+    HistoryCommand,
+    MaskPatchCommand,
+)
 from image_extraction_tool.application.export_task import ExportWorker
-from image_extraction_tool.domain.brush import BrushSettings, paint_mask_segment
+from image_extraction_tool.domain.brush import BrushSettings, brush_segment_bounds, paint_mask_segment
+from image_extraction_tool.domain.color_selection import SelectedColor, build_color_mask, representative_colors
 from image_extraction_tool.domain.compositor import compose_result
 from image_extraction_tool.domain.document import ImageDocument, ToolType
 from image_extraction_tool.errors import ImageLoadError
 from image_extraction_tool.infrastructure.image_io import SUPPORTED_EXTENSIONS, load_image
 from image_extraction_tool.ui.canvas_view import CanvasView
+from image_extraction_tool.ui.color_panel import ColorPanel
 
 
 class MainWindow(QMainWindow):
@@ -30,6 +43,9 @@ class MainWindow(QMainWindow):
         # 导出任务运行期间非空，用于防止重复启动并在关闭窗口时等待线程收尾
         self._export_thread: QThread | None = None
         self._export_worker: ExportWorker | None = None
+        self._active_tool = ToolType.NONE
+        self.history = CommandStack(max_commands=100, max_bytes=256 * 1024 * 1024)
+        self._stroke_recorder: BrushStrokeRecorder | None = None
         self.setObjectName("mainWindow")
         self.setWindowTitle("智能抠图工具")
         self.resize(1100, 720)
@@ -37,6 +53,8 @@ class MainWindow(QMainWindow):
 
         self.canvas = CanvasView(self)
         self.setCentralWidget(self.canvas)
+        self.color_panel = ColorPanel(self)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.color_panel)
         self._size_label = QLabel("未加载图片")
         self._zoom_label = QLabel("—")
         self._tool_label = QLabel("工具：无")
@@ -67,6 +85,27 @@ class MainWindow(QMainWindow):
         self.export_action.triggered.connect(self.export_dialog)
         toolbar.addAction(self.export_action)
 
+        self.undo_action = QAction("撤销", self)
+        self.undo_action.setObjectName("undoAction")
+        # Windows 明确使用 Ctrl+Z / Ctrl+Y；显式序列也便于真实键盘事件测试，
+        # 避免部分 Qt/PySide 版本把 StandardKey 枚举转换成空序列。
+        self.undo_action.setShortcut(QKeySequence("Ctrl+Z"))
+        self.undo_action.setEnabled(False)
+        self.undo_action.triggered.connect(self.undo)
+        toolbar.addAction(self.undo_action)
+
+        self.redo_action = QAction("重做", self)
+        self.redo_action.setObjectName("redoAction")
+        self.redo_action.setShortcut(QKeySequence("Ctrl+Y"))
+        self.redo_action.setEnabled(False)
+        self.redo_action.triggered.connect(self.redo)
+        toolbar.addAction(self.redo_action)
+
+        self.cancel_action = QAction(self)
+        self.cancel_action.setShortcut(QKeySequence(Qt.Key.Key_Escape))
+        self.cancel_action.triggered.connect(self.canvas.cancel_current_operation)
+        self.addAction(self.cancel_action)
+
         toolbar.addSeparator()
         self.fit_action = QAction("适应窗口", self)
         self.fit_action.setObjectName("fitImageAction")
@@ -84,9 +123,12 @@ class MainWindow(QMainWindow):
         toolbar.addAction(self.actual_size_action)
 
         toolbar.addSeparator()
-        # 两个画笔动作放在同一个互斥组里，由 Qt 保证“同时只有一个生效”
+        # 取色和两种画笔放在同一个互斥组里，由 Qt 保证“同时只有一个生效”
         self.tool_group = QActionGroup(self)
         self.tool_group.setExclusive(True)
+        self.color_picker_action = QAction("选取色块", self, checkable=True)
+        self.color_picker_action.setObjectName("colorPickerAction")
+        self.color_picker_action.setData(ToolType.COLOR_PICKER)
         self.erase_action = QAction("抠除画笔", self, checkable=True)
         self.erase_action.setObjectName("eraseBrushAction")
         # 用 data 携带工具枚举，避免再维护一份“动作 → 工具”的映射
@@ -94,7 +136,7 @@ class MainWindow(QMainWindow):
         self.restore_action = QAction("恢复画笔", self, checkable=True)
         self.restore_action.setObjectName("restoreBrushAction")
         self.restore_action.setData(ToolType.RESTORE_BRUSH)
-        for action in (self.erase_action, self.restore_action):
+        for action in (self.color_picker_action, self.erase_action, self.restore_action):
             action.setEnabled(False)
             self.tool_group.addAction(action)
             toolbar.addAction(action)
@@ -135,7 +177,16 @@ class MainWindow(QMainWindow):
         toolbar.addAction(self.clear_brush_action)
 
         self.canvas.zoom_changed.connect(self._update_zoom)
+        self.canvas.brush_started.connect(self._begin_brush_stroke)
         self.canvas.brush_segment.connect(self._paint_segment)
+        self.canvas.brush_finished.connect(self._finish_brush_stroke)
+        self.canvas.brush_cancelled.connect(self._cancel_brush_stroke)
+        self.canvas.color_point_selected.connect(self._select_color_point)
+        self.canvas.color_region_selected.connect(self._select_color_region)
+        self.canvas.hover_position_changed.connect(self._update_hover_color)
+        self.color_panel.tolerance_changed.connect(self._change_color_tolerance)
+        self.color_panel.remove_requested.connect(self.remove_selected_color)
+        self.color_panel.clear_requested.connect(self.clear_selected_colors)
 
     def open_image_dialog(self) -> None:
         """弹出文件选择框并加载用户选中的图片。"""
@@ -160,6 +211,9 @@ class MainWindow(QMainWindow):
             return False
 
         self.document = new_document
+        self._stroke_recorder = None
+        self.history.clear()
+        self._update_history_actions()
         # 画布显示的是合成结果而非原图，保证预览与最终导出一致
         self.canvas.set_image(compose_result(new_document))
         width, height = new_document.size
@@ -167,6 +221,8 @@ class MainWindow(QMainWindow):
         self.fit_action.setEnabled(True)
         self.actual_size_action.setEnabled(True)
         self.export_action.setEnabled(True)
+        self.color_panel.set_tolerance(new_document.color_tolerance)
+        self.color_panel.set_colors(new_document.selected_colors)
         self._set_editing_enabled(True)
         # 载入后默认选中抠除画笔，用户可以立即在图上涂抹
         self.erase_action.setChecked(True)
@@ -177,6 +233,7 @@ class MainWindow(QMainWindow):
     def _set_editing_enabled(self, enabled: bool) -> None:
         """统一开关全部画笔相关控件（导出期间会临时关闭）。"""
         for control in (
+            self.color_picker_action,
             self.erase_action,
             self.restore_action,
             self.clear_brush_action,
@@ -185,15 +242,22 @@ class MainWindow(QMainWindow):
             self.brush_opacity,
         ):
             control.setEnabled(enabled)
+        self.color_panel.set_document_enabled(enabled)
 
     def _tool_selected(self, action: QAction) -> None:
         """互斥组选中变化时切换当前工具。"""
         self._set_active_tool(action.data())
 
     def _set_active_tool(self, tool: ToolType) -> None:
-        """同步当前工具到画布与状态栏；非画笔类工具一律视为“无”。"""
-        self.canvas.set_active_tool(tool if tool in (ToolType.ERASE_BRUSH, ToolType.RESTORE_BRUSH) else None)
-        names = {ToolType.ERASE_BRUSH: "抠除画笔", ToolType.RESTORE_BRUSH: "恢复画笔"}
+        """同步当前互斥工具到画布与状态栏。"""
+        self._active_tool = tool
+        active = tool if tool in (ToolType.COLOR_PICKER, ToolType.ERASE_BRUSH, ToolType.RESTORE_BRUSH) else None
+        self.canvas.set_active_tool(active)
+        names = {
+            ToolType.COLOR_PICKER: "选取色块",
+            ToolType.ERASE_BRUSH: "抠除画笔",
+            ToolType.RESTORE_BRUSH: "恢复画笔",
+        }
         self._tool_label.setText(f"工具：{names.get(tool, '无')}")
 
     def _brush_settings(self) -> BrushSettings:
@@ -209,10 +273,20 @@ class MainWindow(QMainWindow):
         if self.document is None:
             return
         # 画布只负责报坐标，具体落到哪张蒙版由这里按当前选中工具决定
-        tool = self.erase_action.data() if self.erase_action.isChecked() else self.restore_action.data()
+        tool = self._active_tool
         if tool not in (ToolType.ERASE_BRUSH, ToolType.RESTORE_BRUSH):
             return
         target = self.document.erase_mask if tool is ToolType.ERASE_BRUSH else self.document.restore_mask
+        if self._stroke_recorder is None:
+            self._begin_brush_stroke()
+        bounds = brush_segment_bounds(
+            self.document.size,
+            (start.x(), start.y()),
+            (end.x(), end.y()),
+            self.brush_size.value(),
+        )
+        if bounds is not None and self._stroke_recorder is not None:
+            self._stroke_recorder.include_before(bounds)
         affected = paint_mask_segment(
             target,
             (start.x(), start.y()),
@@ -224,13 +298,236 @@ class MainWindow(QMainWindow):
             self.document.mark_edited()
             self.canvas.update_image(compose_result(self.document))
 
+    def _begin_brush_stroke(self) -> None:
+        """为当前画笔创建受影响矩形记录器，不复制整张蒙版。"""
+        if self.document is None:
+            return
+        if self._active_tool is ToolType.ERASE_BRUSH:
+            self._stroke_recorder = BrushStrokeRecorder(self.document, "erase_mask", "抠除笔画")
+        elif self._active_tool is ToolType.RESTORE_BRUSH:
+            self._stroke_recorder = BrushStrokeRecorder(self.document, "restore_mask", "恢复笔画")
+
+    def _finish_brush_stroke(self) -> None:
+        if self._stroke_recorder is None:
+            return
+        command = self._stroke_recorder.finish()
+        self._stroke_recorder = None
+        if command is not None:
+            self._push_history(command)
+
+    def _cancel_brush_stroke(self) -> None:
+        if self._stroke_recorder is None:
+            return
+        restored = self._stroke_recorder.cancel()
+        self._stroke_recorder = None
+        if restored and self.document is not None:
+            self.canvas.update_image(compose_result(self.document))
+
+    def _select_color_point(self, position: QPointF) -> None:
+        """从不可变原图采集单点颜色并重建颜色蒙版。"""
+        if self.document is None or self._active_tool is not ToolType.COLOR_PICKER:
+            return
+        x = min(max(floor(position.x()), 0), self.document.size[0] - 1)
+        y = min(max(floor(position.y()), 0), self.document.size[1] - 1)
+        red, green, blue, _ = self.document.original_pixel(x, y)
+        self._add_selected_colors([SelectedColor((red, green, blue))])
+
+    def _select_color_region(self, region: QRectF) -> None:
+        """从原图框选区域提取多种代表色并加入可见列表。"""
+        if self.document is None or self._active_tool is not ToolType.COLOR_PICKER:
+            return
+        colors = representative_colors(
+            self.document.original_rgba,
+            (region.left(), region.top(), region.right(), region.bottom()),
+        )
+        self._add_selected_colors(colors)
+
+    def _add_selected_colors(self, colors: list[SelectedColor]) -> None:
+        if self.document is None:
+            return
+        before_colors = tuple(self.document.selected_colors)
+        before_tolerance = self.document.color_tolerance
+        if not self.document.add_selected_colors(colors):
+            return
+        self._rebuild_color_mask()
+        self._push_history(
+            ColorStateCommand(
+                self.document,
+                before_colors,
+                before_tolerance,
+                tuple(self.document.selected_colors),
+                self.document.color_tolerance,
+                "添加背景色",
+            )
+        )
+
+    def _rebuild_color_mask(self) -> None:
+        """始终从不可变原图和当前参数重新计算颜色蒙版。"""
+        if self.document is None:
+            return
+        self.document.color_mask = build_color_mask(
+            self.document.original_rgba,
+            self.document.selected_colors,
+            self.document.color_tolerance,
+        )
+        self.document.mark_edited()
+        self.color_panel.set_colors(self.document.selected_colors)
+        self.canvas.update_image(compose_result(self.document))
+
+    def _change_color_tolerance(self, tolerance: int) -> None:
+        if self.document is None or tolerance == self.document.color_tolerance:
+            return
+        before_colors = tuple(self.document.selected_colors)
+        before_tolerance = self.document.color_tolerance
+        self.document.color_tolerance = tolerance
+        self._rebuild_color_mask()
+        self._push_history(
+            ColorStateCommand(
+                self.document,
+                before_colors,
+                before_tolerance,
+                tuple(self.document.selected_colors),
+                tolerance,
+                "修改颜色容差",
+            )
+        )
+
+    def remove_selected_color(self, index: int) -> None:
+        """移除指定列表项并由剩余颜色重建蒙版。"""
+        if self.document is None or not 0 <= index < len(self.document.selected_colors):
+            return
+        before_colors = tuple(self.document.selected_colors)
+        before_tolerance = self.document.color_tolerance
+        del self.document.selected_colors[index]
+        self._rebuild_color_mask()
+        self._push_history(
+            ColorStateCommand(
+                self.document,
+                before_colors,
+                before_tolerance,
+                tuple(self.document.selected_colors),
+                self.document.color_tolerance,
+                "移除背景色",
+            )
+        )
+
+    def clear_selected_colors(self) -> None:
+        """只清空颜色选择，保留抠除与恢复画笔。"""
+        if self.document is None or not self.document.selected_colors:
+            return
+        before_colors = tuple(self.document.selected_colors)
+        before_tolerance = self.document.color_tolerance
+        self.document.clear_color_selection()
+        self.color_panel.set_colors([])
+        self.canvas.update_image(compose_result(self.document))
+        self.statusBar().showMessage("已清空颜色选择", 3000)
+        self._push_history(
+            ColorStateCommand(
+                self.document,
+                before_colors,
+                before_tolerance,
+                (),
+                self.document.color_tolerance,
+                "清空颜色选择",
+            )
+        )
+
+    def _update_hover_color(self, position: QPointF | None) -> None:
+        """从不可变原图显示指针下的色块、RGB 与 HEX。"""
+        if self.document is None or position is None:
+            self.color_panel.set_hover_color(None)
+            return
+        x = min(max(floor(position.x()), 0), self.document.size[0] - 1)
+        y = min(max(floor(position.y()), 0), self.document.size[1] - 1)
+        red, green, blue, _ = self.document.original_pixel(x, y)
+        self.color_panel.set_hover_color((red, green, blue))
+
     def clear_brush_edits(self) -> None:
         """清空抠除与恢复画笔，并刷新预览。"""
         if self.document is None:
             return
+        before = {
+            "erase_mask": self.document.erase_mask.copy(),
+            "restore_mask": self.document.restore_mask.copy(),
+        }
         self.document.clear_brush_masks()
         self.canvas.update_image(compose_result(self.document))
         self.statusBar().showMessage("已清空抠除与恢复画笔修改", 3000)
+        commands: list[MaskPatchCommand] = []
+        for mask_name in ("erase_mask", "restore_mask"):
+            # 清空只会改变原本非零的区域，历史数据也只保存该区域，
+            # 避免大图上的稀疏画笔因一次清空而退化为整图历史副本。
+            changed_bbox = before[mask_name].getbbox()
+            if changed_bbox is not None:
+                after = getattr(self.document, mask_name)
+                commands.append(
+                    MaskPatchCommand.from_images(
+                        self.document,
+                        mask_name,
+                        changed_bbox,
+                        before[mask_name].crop(changed_bbox),
+                        after.crop(changed_bbox),
+                        description="清空画笔修改",
+                    )
+                )
+        if commands:
+            self._push_history(CompoundCommand(tuple(commands), "清空画笔修改"))
+
+    def apply_ai_mask(self, new_mask: Image.Image) -> None:
+        """原子应用一个已成功生成的 AI 蒙版，并把它写入编辑历史。
+
+        阶段 5 的后台推理只需在成功信号中调用本入口；尺寸或模式校验失败
+        会在写入文档和历史之前抛错，当前编辑状态保持不变。
+        """
+        if self.document is None:
+            raise RuntimeError("尚未加载图片")
+        command = ApplyAiMaskCommand.create(self.document, new_mask)
+        command.redo()
+        self._push_history(command)
+        self._sync_document_to_ui()
+
+    def _push_history(self, command: HistoryCommand) -> None:
+        """记录已成功应用的命令并同步动作状态。"""
+        self.history.push_applied(command)
+        self._update_history_actions()
+
+    def undo(self) -> None:
+        """撤销一个完整编辑操作并刷新全部派生 UI。"""
+        if self._stroke_recorder is not None:
+            # 编辑中的笔画尚未进入历史；撤销键先取消它，不能越过它继续
+            # 撤销上一条已完成命令。
+            self.canvas.cancel_current_operation()
+            self._update_history_actions()
+            return
+        self.canvas.cancel_current_operation()
+        if self.history.undo():
+            self._sync_document_to_ui()
+            self.statusBar().showMessage("已撤销", 2000)
+        self._update_history_actions()
+
+    def redo(self) -> None:
+        """重做一个完整编辑操作并刷新全部派生 UI。"""
+        self.canvas.cancel_current_operation()
+        if self.history.redo():
+            self._sync_document_to_ui()
+            self.statusBar().showMessage("已重做", 2000)
+        self._update_history_actions()
+
+    def _sync_document_to_ui(self) -> None:
+        if self.document is None:
+            return
+        self.color_panel.set_tolerance(self.document.color_tolerance)
+        self.color_panel.set_colors(self.document.selected_colors)
+        self.canvas.update_image(compose_result(self.document))
+
+    def _update_history_actions(self) -> None:
+        enabled = self.document is not None and self._export_thread is None
+        self.undo_action.setEnabled(enabled and self.history.can_undo)
+        self.redo_action.setEnabled(enabled and self.history.can_redo)
+        undo_name = self.history.undo_description
+        redo_name = self.history.redo_description
+        self.undo_action.setText(f"撤销 {undo_name}" if undo_name else "撤销")
+        self.redo_action.setText(f"重做 {redo_name}" if redo_name else "重做")
 
     def export_dialog(self) -> None:
         """弹出保存对话框，并以其结果启动后台导出。"""
@@ -251,7 +548,9 @@ class MainWindow(QMainWindow):
         # 导出期间冻结编辑入口，避免合成读到的蒙版被同时修改
         self._set_editing_enabled(False)
         self.export_action.setEnabled(False)
-        self.canvas.set_active_tool(None)
+        self.undo_action.setEnabled(False)
+        self.redo_action.setEnabled(False)
+        self._set_active_tool(ToolType.NONE)
         self.statusBar().showMessage(f"正在导出 {destination.name}…")
 
         # worker 移入子线程后只能通过信号交互：成功/失败负责回传结果、
@@ -290,8 +589,11 @@ class MainWindow(QMainWindow):
         has_document = self.document is not None
         self._set_editing_enabled(has_document)
         self.export_action.setEnabled(has_document)
+        self._update_history_actions()
         # 恢复导出前选中的画笔工具
-        if self.erase_action.isChecked():
+        if self.color_picker_action.isChecked():
+            self._set_active_tool(ToolType.COLOR_PICKER)
+        elif self.erase_action.isChecked():
             self._set_active_tool(ToolType.ERASE_BRUSH)
         elif self.restore_action.isChecked():
             self._set_active_tool(ToolType.RESTORE_BRUSH)

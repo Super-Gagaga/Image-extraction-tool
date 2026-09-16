@@ -3,7 +3,7 @@
 from PIL import Image
 import pytest
 from PySide6.QtCore import QPoint, QPointF, Qt
-from PySide6.QtGui import QWheelEvent
+from PySide6.QtGui import QPainter, QWheelEvent
 from PySide6.QtWidgets import QApplication
 
 from image_extraction_tool.ui.canvas_view import CanvasView
@@ -74,3 +74,12 @@ def test_wheel_zoom_keeps_image_point_under_pointer(qtbot) -> None:
     assert view.zoom_factor == pytest.approx(1.15)
     assert after.x() == pytest.approx(before.x(), abs=0.01)
     assert after.y() == pytest.approx(before.y(), abs=0.01)
+
+
+def test_canvas_uses_original_pixel_nearest_neighbor_rendering(qtbot) -> None:
+    """画布缩放不得在原图像素之间生成平滑插值颜色。"""
+    view = CanvasView()
+    qtbot.addWidget(view)
+
+    assert view._image_item.transformationMode() == Qt.TransformationMode.FastTransformation
+    assert not view.renderHints() & QPainter.RenderHint.SmoothPixmapTransform

@@ -6,6 +6,7 @@ from PIL import Image
 import pytest
 
 from image_extraction_tool.domain.compositor import compose_result
+from image_extraction_tool.domain.color_selection import SelectedColor, build_color_mask
 from image_extraction_tool.domain.document import ImageDocument
 from image_extraction_tool.infrastructure.exporter import export_png
 from image_extraction_tool.errors import ExportError
@@ -39,3 +40,47 @@ def test_export_failure_is_reported_and_leaves_no_temporary_png(tmp_path: Path) 
         export_png(document, blocking_file / "result.png")
 
     assert list(tmp_path.glob(".*.png")) == []
+
+
+def test_export_includes_color_selection_mask(tmp_path: Path) -> None:
+    """验证颜色抠除结果经过统一合成管线进入最终 PNG。"""
+    source = Image.new("RGBA", (2, 1))
+    source.putdata([(20, 40, 60, 255), (200, 210, 220, 255)])
+    document = ImageDocument(source)
+    selected = SelectedColor((20, 40, 60))
+    document.add_selected_colors([selected])
+    document.color_mask = build_color_mask(document.original_rgba, document.selected_colors, tolerance=0)
+
+    output = export_png(document, tmp_path / "color-result.png")
+
+    with Image.open(output) as exported:
+        assert [exported.getpixel((x, 0))[3] for x in range(2)] == [0, 255]
+
+
+def test_export_uses_binary_union_at_original_resolution(tmp_path: Path) -> None:
+    """验证导出按原图像素合并颜色和画笔区域，并保留其余 RGBA。"""
+    source = Image.new("RGBA", (3, 2))
+    source.putdata(
+        [
+            (1, 2, 3, 40),
+            (4, 5, 6, 80),
+            (7, 8, 9, 120),
+            (10, 11, 12, 160),
+            (13, 14, 15, 200),
+            (16, 17, 18, 240),
+        ]
+    )
+    document = ImageDocument(source)
+    document.color_mask.putpixel((0, 0), 0)
+    document.erase_mask.putpixel((1, 1), 12)
+
+    output = export_png(document, tmp_path / "binary-union.png")
+
+    with Image.open(output) as exported:
+        exported.load()
+        assert exported.mode == "RGBA"
+        assert exported.size == source.size
+        assert exported.getpixel((0, 0)) == (1, 2, 3, 0)
+        assert exported.getpixel((1, 1)) == (13, 14, 15, 0)
+        assert exported.getpixel((2, 0)) == source.getpixel((2, 0))
+        assert exported.getpixel((2, 1)) == source.getpixel((2, 1))
