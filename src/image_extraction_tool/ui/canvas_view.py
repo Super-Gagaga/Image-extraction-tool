@@ -1,4 +1,4 @@
-"""支持缩放与平移的图片画布。"""
+"""支持缩放、平移与画笔交互的图片画布。"""
 
 from __future__ import annotations
 
@@ -10,7 +10,6 @@ from PySide6.QtGui import (
     QImage,
     QMouseEvent,
     QPainter,
-    QPen,
     QPixmap,
     QWheelEvent,
 )
@@ -40,6 +39,9 @@ class CanvasView(QGraphicsView):
     """场景坐标即原图像素坐标的图片视图。"""
 
     zoom_changed = Signal(float)
+    # 画笔事件用 object 传递 QPointF：(起点, 终点) 表示一段笔迹
+    brush_segment = Signal(object, object)
+    brush_finished = Signal()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -53,6 +55,10 @@ class CanvasView(QGraphicsView):
         self._has_image = False
         self._panning = False
         self._pan_origin = QPoint()
+        # 左键工具（None 表示左键不参与编辑）；绘画状态由按下/移动/松开依次维护
+        self._active_tool = None
+        self._brushing = False
+        self._brush_last_position: QPointF | None = None
 
         self.setBackgroundBrush(self._checkerboard_brush())
         self.setFrameShape(QGraphicsView.Shape.NoFrame)
@@ -91,6 +97,31 @@ class CanvasView(QGraphicsView):
         self._scene.setSceneRect(0.0, 0.0, float(pixmap.width()), float(pixmap.height()))
         self._has_image = True
         self.fit_image()
+
+    def update_image(self, image: Image.Image) -> None:
+        """替换同尺寸预览缓存，并保留当前缩放和平移。
+
+        与 set_image 的区别是不重置视图变换，因此画笔编辑时可以边画边刷新预览。
+        """
+        pixmap = QPixmap.fromImage(pil_to_qimage(image))
+        self._image_item.setPixmap(pixmap)
+        self._scene.setSceneRect(0.0, 0.0, float(pixmap.width()), float(pixmap.height()))
+
+    def set_active_tool(self, tool) -> None:
+        """设置当前左键工具；具体枚举由窗口层管理，避免画布依赖文档模型。"""
+        self._active_tool = tool
+
+    def _editable_scene_position(self, event: QMouseEvent) -> QPointF | None:
+        """返回事件对应的原图坐标；落在图片之外时返回 None。
+
+        图片外的左键拖动不参与绘画，直接交回基类处理。
+        """
+        position = self.mapToScene(event.position().toPoint())
+        # boundingRect 与场景矩形一致，即图片像素范围
+        bounds = self._image_item.boundingRect()
+        if 0.0 <= position.x() < bounds.width() and 0.0 <= position.y() < bounds.height():
+            return position
+        return None
 
     def fit_image(self) -> None:
         """缩放图片直到完整适应窗口，保持宽高比。"""
@@ -135,17 +166,26 @@ class CanvasView(QGraphicsView):
         event.accept()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
-        """右键按下开始拖动平移。"""
+        """右键按下开始拖动平移；左键在图片内按下则开始一段笔迹。"""
         if event.button() == Qt.MouseButton.RightButton and self._has_image:
             self._panning = True
             self._pan_origin = event.position().toPoint()
             self.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
             event.accept()
             return
+        if event.button() == Qt.MouseButton.LeftButton and self._has_image and self._active_tool is not None:
+            position = self._editable_scene_position(event)
+            if position is not None:
+                self._brushing = True
+                self._brush_last_position = position
+                # 起点与终点相同即单点笔迹，使单击也能落笔
+                self.brush_segment.emit(position, position)
+                event.accept()
+                return
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
-        """平移过程中按拖动增量滚动滚动条。"""
+        """平移时按拖动增量滚动滚动条；绘画时按上一位置到当前位置发出笔迹。"""
         if self._panning:
             current = event.position().toPoint()
             delta = current - self._pan_origin
@@ -155,13 +195,31 @@ class CanvasView(QGraphicsView):
             self.verticalScrollBar().setValue(self.verticalScrollBar().value() - delta.y())
             event.accept()
             return
+        # 只在图片内继续落笔；移出图片时保留上一次位置，回到图片内可继续连线
+        if self._brushing and self._brush_last_position is not None:
+            position = self._editable_scene_position(event)
+            if position is not None:
+                self.brush_segment.emit(self._brush_last_position, position)
+                self._brush_last_position = position
+            event.accept()
+            return
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
-        """右键松开结束拖动平移并恢复光标。"""
+        """右键松开结束平移；左键松开补齐最后一段笔迹并结束本次绘制。"""
         if event.button() == Qt.MouseButton.RightButton and self._panning:
             self._panning = False
             self.viewport().unsetCursor()
+            event.accept()
+            return
+        if event.button() == Qt.MouseButton.LeftButton and self._brushing:
+            # 松开前再画一次，覆盖快速拖动时最后一段来不及处理的距离
+            position = self._editable_scene_position(event)
+            if position is not None and self._brush_last_position is not None:
+                self.brush_segment.emit(self._brush_last_position, position)
+            self._brushing = False
+            self._brush_last_position = None
+            self.brush_finished.emit()
             event.accept()
             return
         super().mouseReleaseEvent(event)
