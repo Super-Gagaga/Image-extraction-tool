@@ -195,10 +195,16 @@ class CanvasView(QGraphicsView):
             self.verticalScrollBar().setValue(self.verticalScrollBar().value() - delta.y())
             event.accept()
             return
-        # 只在图片内继续落笔；移出图片时保留上一次位置，回到图片内可继续连线
-        if self._brushing and self._brush_last_position is not None:
+        if self._brushing:
             position = self._editable_scene_position(event)
-            if position is not None:
+            if position is None:
+                # 离开图片即断开当前连续段；再次进入时从新位置起笔，
+                # 避免沿图片外的未知鼠标轨迹错误补出一条跨图直线。
+                self._brush_last_position = None
+            elif self._brush_last_position is None:
+                self.brush_segment.emit(position, position)
+                self._brush_last_position = position
+            else:
                 self.brush_segment.emit(self._brush_last_position, position)
                 self._brush_last_position = position
             event.accept()
@@ -215,8 +221,9 @@ class CanvasView(QGraphicsView):
         if event.button() == Qt.MouseButton.LeftButton and self._brushing:
             # 松开前再画一次，覆盖快速拖动时最后一段来不及处理的距离
             position = self._editable_scene_position(event)
-            if position is not None and self._brush_last_position is not None:
-                self.brush_segment.emit(self._brush_last_position, position)
+            if position is not None:
+                segment_start = self._brush_last_position or position
+                self.brush_segment.emit(segment_start, position)
             self._brushing = False
             self._brush_last_position = None
             self.brush_finished.emit()

@@ -96,6 +96,35 @@ def test_right_drag_never_paints_and_clear_restores_preview(qtbot, tmp_path: Pat
     assert compose_alpha(window.document).getextrema() == (255, 255)
 
 
+def test_brush_reentry_does_not_bridge_across_image(qtbot, tmp_path: Path) -> None:
+    """笔画移出图片再进入时，应在新位置重新起笔而不是跨图连线。"""
+    window = _loaded_window(qtbot, tmp_path)
+    window.brush_size.setValue(1)
+    window.canvas.resetTransform()
+    window.canvas.centerOn(80.0, 60.0)
+    start = window.canvas.mapFromScene(QPointF(10.5, 60.5))
+    outside = window.canvas.mapFromScene(QPointF(80.0, -20.0))
+    reentry = window.canvas.mapFromScene(QPointF(150.5, 60.5))
+    mapped_start = window.canvas.image_position(start)
+    mapped_reentry = window.canvas.image_position(reentry)
+    start_pixel = (floor(mapped_start.x()), floor(mapped_start.y()))
+    reentry_pixel = (floor(mapped_reentry.x()), floor(mapped_reentry.y()))
+    bridge_pixel = (
+        floor((mapped_start.x() + mapped_reentry.x()) / 2.0),
+        floor((mapped_start.y() + mapped_reentry.y()) / 2.0),
+    )
+
+    qtbot.mousePress(window.canvas.viewport(), Qt.MouseButton.LeftButton, pos=start)
+    qtbot.mouseMove(window.canvas.viewport(), pos=outside)
+    qtbot.mouseMove(window.canvas.viewport(), pos=reentry)
+    qtbot.mouseRelease(window.canvas.viewport(), Qt.MouseButton.LeftButton, pos=reentry)
+
+    assert window.document is not None
+    assert window.document.erase_mask.getpixel(start_pixel) == 255
+    assert window.document.erase_mask.getpixel(reentry_pixel) == 255
+    assert window.document.erase_mask.getpixel(bridge_pixel) == 0
+
+
 def test_export_runs_in_worker_and_matches_preview(qtbot, tmp_path: Path) -> None:
     """验证导出在后台线程完成，且文件内容与预览合成一致。"""
     window = _loaded_window(qtbot, tmp_path)
