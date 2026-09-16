@@ -15,6 +15,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import QGraphicsPixmapItem, QGraphicsScene, QGraphicsView, QRubberBand
 
+from image_extraction_tool.domain.coordinates import canvas_to_pixel
 from image_extraction_tool.domain.document import ToolType
 
 
@@ -166,7 +167,29 @@ class CanvasView(QGraphicsView):
 
     def image_position(self, viewport_position: QPoint | QPointF) -> QPointF:
         """把视口坐标映射为原图坐标。"""
-        return self.mapToScene(viewport_position.toPoint() if isinstance(viewport_position, QPointF) else viewport_position)
+        # QPointF 路径保留子像素精度；QGraphicsView 会在此处反向应用
+        # 当前 scale、滚动偏移和高 DPI 设备像素比。
+        return self.mapToScene(viewport_position)
+
+    def image_pixel_position(self, viewport_position: QPoint | QPointF) -> tuple[int, int] | None:
+        """把视口坐标映射为一个原图像素，越界时返回 ``None``。
+
+        Qt 的 viewport 坐标使用逻辑像素，``mapToScene`` 会同时反向处理
+        QGraphicsView 的缩放、滚动和平移，以及高 DPI 设备的设备像素比。
+        因此这里等价于先得到画布坐标，再执行
+        ``floor((canvas - offset) / scale)``，不会把越界位置夹到边缘。
+        """
+        if not self._has_image:
+            return None
+        scene_position = self.image_position(viewport_position)
+        return canvas_to_pixel(
+            scene_position.x(),
+            scene_position.y(),
+            scale=1.0,
+            offset_x=0.0,
+            offset_y=0.0,
+            image_size=(self._image_item.pixmap().width(), self._image_item.pixmap().height()),
+        )
 
     def wheelEvent(self, event: QWheelEvent) -> None:
         """以鼠标指针为锚点进行滚轮缩放。"""

@@ -84,3 +84,21 @@ def test_export_uses_binary_union_at_original_resolution(tmp_path: Path) -> None
         assert exported.getpixel((1, 1)) == (13, 14, 15, 0)
         assert exported.getpixel((2, 0)) == source.getpixel((2, 0))
         assert exported.getpixel((2, 1)) == source.getpixel((2, 1))
+
+
+def test_export_round_trip_preserves_unedited_rgba_pixels(tmp_path: Path) -> None:
+    source = Image.new("RGBA", (3, 1))
+    source.putdata([(10, 20, 30, 17), (40, 50, 60, 128), (70, 80, 90, 255)])
+    document = ImageDocument(source)
+    document.erase_mask.putpixel((1, 0), 255)
+
+    output = export_png(document, tmp_path / "round-trip.png")
+
+    with Image.open(output) as exported:
+        exported.load()
+        assert list(exported.getdata()) == [
+            (10, 20, 30, 17),
+            (40, 50, 60, 0),
+            (70, 80, 90, 255),
+        ]
+    assert document.original_rgba.tobytes() == source.tobytes()

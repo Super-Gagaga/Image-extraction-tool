@@ -327,8 +327,9 @@ class MainWindow(QMainWindow):
         """从不可变原图采集单点颜色并重建颜色蒙版。"""
         if self.document is None or self._active_tool is not ToolType.COLOR_PICKER:
             return
-        x = min(max(floor(position.x()), 0), self.document.size[0] - 1)
-        y = min(max(floor(position.y()), 0), self.document.size[1] - 1)
+        x, y = floor(position.x()), floor(position.y())
+        if not (0 <= x < self.document.size[0] and 0 <= y < self.document.size[1]):
+            return
         red, green, blue, _ = self.document.original_pixel(x, y)
         self._add_selected_colors([SelectedColor((red, green, blue))])
 
@@ -437,8 +438,10 @@ class MainWindow(QMainWindow):
         if self.document is None or position is None:
             self.color_panel.set_hover_color(None)
             return
-        x = min(max(floor(position.x()), 0), self.document.size[0] - 1)
-        y = min(max(floor(position.y()), 0), self.document.size[1] - 1)
+        x, y = floor(position.x()), floor(position.y())
+        if not (0 <= x < self.document.size[0] and 0 <= y < self.document.size[1]):
+            self.color_panel.set_hover_color(None)
+            return
         red, green, blue, _ = self.document.original_pixel(x, y)
         self.color_panel.set_hover_color((red, green, blue))
 

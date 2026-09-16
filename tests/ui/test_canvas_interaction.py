@@ -47,6 +47,21 @@ def test_actual_size_maps_viewport_distance_to_same_image_distance(qtbot) -> Non
     assert second.x() - first.x() == pytest.approx(1.0)
 
 
+def test_image_pixel_position_floors_scene_coordinate_and_rejects_outside(qtbot) -> None:
+    """验证像素定位保留缩放/平移后的整数像素语义，并忽略图片外位置。"""
+    view = CanvasView()
+    view.resize(400, 300)
+    qtbot.addWidget(view)
+    view.show()
+    view.set_image(Image.new("RGBA", (80, 60), "white"))
+    view.show_actual_size()
+
+    inside = view.mapFromScene(QPointF(12.1, 8.1))
+    assert view.image_pixel_position(inside) == (12, 8)
+    outside = view.mapFromScene(QPointF(-10.0, 8.1))
+    assert view.image_pixel_position(outside) is None
+
+
 def test_wheel_zoom_keeps_image_point_under_pointer(qtbot) -> None:
     """验证滚轮缩放后指针下方的图像点保持不动，且缩放倍数为 1.15。"""
     view = CanvasView()

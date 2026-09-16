@@ -31,6 +31,18 @@ def test_invalid_image_does_not_decode(tmp_path: Path) -> None:
         load_image(path)
 
 
+def test_load_preserves_rgba_pixels_and_dimensions(tmp_path: Path) -> None:
+    path = tmp_path / "rgba.png"
+    source = Image.new("RGBA", (2, 1))
+    source.putdata([(1, 2, 3, 0), (250, 240, 230, 127)])
+    source.save(path)
+
+    document = load_image(path)
+
+    assert document.size == (2, 1)
+    assert list(document.original_rgba.getdata()) == [(1, 2, 3, 0), (250, 240, 230, 127)]
+
+
 def test_unsupported_extension_is_rejected(tmp_path: Path) -> None:
     """验证不支持的扩展名会抛出带“仅支持”提示的 ImageLoadError。"""
     with pytest.raises(ImageLoadError, match="仅支持"):

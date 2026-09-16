@@ -2,7 +2,7 @@
 
 import pytest
 
-from image_extraction_tool.domain.coordinates import canvas_to_image
+from image_extraction_tool.domain.coordinates import canvas_to_image, canvas_to_pixel
 
 
 def test_canvas_to_image_applies_offset_scale_and_preserves_fractions() -> None:
@@ -33,3 +33,22 @@ def test_canvas_to_image_rejects_invalid_scale() -> None:
     """验证非正缩放系数会抛出 ValueError。"""
     with pytest.raises(ValueError, match="scale"):
         canvas_to_image(0, 0, scale=0, offset_x=0, offset_y=0, image_size=(1, 1))
+
+
+def test_canvas_to_pixel_floors_and_ignores_outside_points() -> None:
+    assert canvas_to_pixel(
+        35.9,
+        45.9,
+        scale=2.0,
+        offset_x=5.0,
+        offset_y=9.0,
+        image_size=(100, 80),
+    ) == (15, 18)
+    assert canvas_to_pixel(
+        4.9,
+        45.0,
+        scale=2.0,
+        offset_x=5.0,
+        offset_y=9.0,
+        image_size=(100, 80),
+    ) is None
