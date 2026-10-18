@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from PIL import Image, ImageChops
 
+from image_extraction_tool.domain.background import flatten_on_background
 from image_extraction_tool.domain.document import ImageDocument
 
 
@@ -13,6 +14,10 @@ def compose_alpha(document: ImageDocument) -> Image.Image:
     颜色匹配区域或抠除画笔触及的像素直接变为完全透明；恢复画笔触及的
     像素恢复为原图自身 Alpha。未触及像素保留原图 Alpha。AI 蒙版仍作为
     后续智能抠图阶段的基础 Alpha，当前默认全白，不改变手工流程。
+
+    两支画笔在落笔时会互相清除对方的蒙版，因此同一像素最多只留在一张画笔
+    蒙版上，恢复层不会把后来的抠除笔迹永久盖住。这里的恢复优先只是兜底：
+    万一两张蒙版仍出现重叠（例如调用方直接改蒙版），恢复依然取最终结果。
     """
     original_alpha = document.original_rgba.getchannel("A")
     # AI 蒙版可以保留灰度边缘；当前尚未运行 AI 时为全白。
@@ -31,7 +36,14 @@ def compose_alpha(document: ImageDocument) -> Image.Image:
 
 
 def compose_result(document: ImageDocument) -> Image.Image:
-    """每次都从不可变原图和当前全尺寸蒙版重新合成 RGBA 结果。"""
+    """每次都从不可变原图、当前全尺寸蒙版和背景重新合成结果。
+
+    没有背景时返回保留透明通道的 RGBA；设置背景后把前景叠加到背景上，
+    预览与导出共用本函数，保证两者像素一致。
+    """
     result = document.original_rgba
     result.putalpha(compose_alpha(document))
-    return result
+    background = document.background
+    if background is None:
+        return result
+    return flatten_on_background(result, background.image)

@@ -9,7 +9,16 @@ from pathlib import Path
 from PIL import Image
 from PySide6.QtCore import QPointF, QRectF, QThread, Qt, Signal
 from PySide6.QtGui import QAction, QActionGroup, QCloseEvent, QDragEnterEvent, QDropEvent, QKeySequence
-from PySide6.QtWidgets import QFileDialog, QLabel, QMainWindow, QMessageBox, QProgressBar, QSpinBox
+from PySide6.QtWidgets import (
+    QFileDialog,
+    QLabel,
+    QMainWindow,
+    QMenu,
+    QMessageBox,
+    QProgressBar,
+    QSpinBox,
+    QToolButton,
+)
 
 from image_extraction_tool.application.command_stack import (
     ApplyAiMaskCommand,
@@ -22,13 +31,22 @@ from image_extraction_tool.application.command_stack import (
 )
 from image_extraction_tool.application.export_task import ExportWorker
 from image_extraction_tool.application.segmentation_task import SegmentationWorker
-from image_extraction_tool.domain.brush import BrushSettings, brush_segment_bounds, paint_mask_segment
+from image_extraction_tool.domain.brush import (
+    BrushSettings,
+    brush_segment_bounds,
+    paint_mask_segment_exclusive,
+)
 from image_extraction_tool.domain.color_selection import SelectedColor, build_color_mask, representative_colors
 from image_extraction_tool.domain.compositor import compose_result
 from image_extraction_tool.domain.document import ImageDocument, ToolType
 from image_extraction_tool.domain.segmentation import CancelToken, Segmenter
 from image_extraction_tool.errors import ImageLoadError, ModelMissingError
-from image_extraction_tool.infrastructure.image_io import SUPPORTED_EXTENSIONS, load_image
+from image_extraction_tool.infrastructure.image_io import (
+    SUPPORTED_EXTENSIONS,
+    load_background_image,
+    load_image,
+)
+from image_extraction_tool.infrastructure.model_profiles import resolve_dynamic_input_size
 from image_extraction_tool.infrastructure.model_store import ModelStore
 from image_extraction_tool.infrastructure.segmenters import OnnxU2NetSegmenter
 from image_extraction_tool.ui.canvas_view import CanvasView
@@ -61,7 +79,10 @@ class MainWindow(QMainWindow):
         self._segmentation_token: CancelToken | None = None
         self._segmentation_document: ImageDocument | None = None
         self._model_store = model_store or ModelStore()
-        self._segmenter_factory = segmenter_factory or (lambda path: OnnxU2NetSegmenter(path))
+        # 动态尺寸模型按已知架构或环境变量选择推理尺寸，避免 1024×1024 模型被降成 320×320
+        self._segmenter_factory = segmenter_factory or (
+            lambda path: OnnxU2NetSegmenter(path, dynamic_input_size=resolve_dynamic_input_size(path))
+        )
         self._active_tool = ToolType.NONE
         self.history = CommandStack(max_commands=100, max_bytes=256 * 1024 * 1024)
         self._stroke_recorder: BrushStrokeRecorder | None = None
@@ -128,6 +149,29 @@ class MainWindow(QMainWindow):
         self.select_model_action.setObjectName("selectModelAction")
         self.select_model_action.triggered.connect(self.select_model_dialog)
         toolbar.addAction(self.select_model_action)
+
+        self.choose_background_action = QAction("选择背景…", self)
+        self.choose_background_action.setObjectName("chooseBackgroundAction")
+        self.choose_background_action.setEnabled(False)
+        self.choose_background_action.triggered.connect(self.select_background_dialog)
+
+        self.clear_background_action = QAction("清除背景", self)
+        self.clear_background_action.setObjectName("clearBackgroundAction")
+        self.clear_background_action.setEnabled(False)
+        self.clear_background_action.triggered.connect(self.clear_background)
+
+        # 两个背景动作合并为一个下拉按钮，避免工具栏在默认窗口宽度下挤出原有控件
+        self.background_menu = QMenu(self)
+        self.background_menu.addAction(self.choose_background_action)
+        self.background_menu.addAction(self.clear_background_action)
+        self.background_button = QToolButton(self)
+        self.background_button.setObjectName("backgroundToolButton")
+        self.background_button.setText("背景")
+        self.background_button.setToolTip("选择或清除背景图片")
+        self.background_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.background_button.setMenu(self.background_menu)
+        self.background_button.setEnabled(False)
+        toolbar.addWidget(self.background_button)
 
         self.undo_action = QAction("撤销", self)
         self.undo_action.setObjectName("undoAction")
@@ -228,6 +272,9 @@ class MainWindow(QMainWindow):
         self.canvas.color_point_selected.connect(self._select_color_point)
         self.canvas.color_region_selected.connect(self._select_color_region)
         self.canvas.hover_position_changed.connect(self._update_hover_color)
+        # 画笔尺寸随时同步到画布，使指针上的作用范围圆环与实际落笔范围一致
+        self.brush_size.valueChanged.connect(self.canvas.set_brush_size)
+        self.canvas.set_brush_size(self.brush_size.value())
         self.color_panel.tolerance_changed.connect(self._change_color_tolerance)
         self.color_panel.remove_requested.connect(self.remove_selected_color)
         self.color_panel.clear_requested.connect(self.clear_selected_colors)
@@ -289,6 +336,12 @@ class MainWindow(QMainWindow):
             self.brush_opacity,
         ):
             control.setEnabled(enabled)
+        # 背景替换同样会改变合成结果，导出或推理期间必须冻结
+        self.background_button.setEnabled(enabled)
+        self.choose_background_action.setEnabled(enabled)
+        self.clear_background_action.setEnabled(
+            enabled and self.document is not None and self.document.background is not None
+        )
         self.color_panel.set_document_enabled(enabled)
 
     def _tool_selected(self, action: QAction) -> None:
@@ -323,7 +376,10 @@ class MainWindow(QMainWindow):
         tool = self._active_tool
         if tool not in (ToolType.ERASE_BRUSH, ToolType.RESTORE_BRUSH):
             return
-        target = self.document.erase_mask if tool is ToolType.ERASE_BRUSH else self.document.restore_mask
+        if tool is ToolType.ERASE_BRUSH:
+            target, opposite = self.document.erase_mask, self.document.restore_mask
+        else:
+            target, opposite = self.document.restore_mask, self.document.erase_mask
         if self._stroke_recorder is None:
             self._begin_brush_stroke()
         bounds = brush_segment_bounds(
@@ -334,8 +390,10 @@ class MainWindow(QMainWindow):
         )
         if bounds is not None and self._stroke_recorder is not None:
             self._stroke_recorder.include_before(bounds)
-        affected = paint_mask_segment(
+        # 落笔的同时清除对方蒙版上的同一批像素，保证后落的那支画笔才是最终结果
+        affected = paint_mask_segment_exclusive(
             target,
+            opposite,
             (start.x(), start.y()),
             (end.x(), end.y()),
             self._brush_settings(),
@@ -350,9 +408,19 @@ class MainWindow(QMainWindow):
         if self.document is None:
             return
         if self._active_tool is ToolType.ERASE_BRUSH:
-            self._stroke_recorder = BrushStrokeRecorder(self.document, "erase_mask", "抠除笔画")
+            self._stroke_recorder = BrushStrokeRecorder(
+                self.document,
+                "erase_mask",
+                "抠除笔画",
+                opposite_mask_name="restore_mask",
+            )
         elif self._active_tool is ToolType.RESTORE_BRUSH:
-            self._stroke_recorder = BrushStrokeRecorder(self.document, "restore_mask", "恢复笔画")
+            self._stroke_recorder = BrushStrokeRecorder(
+                self.document,
+                "restore_mask",
+                "恢复笔画",
+                opposite_mask_name="erase_mask",
+            )
 
     def _finish_brush_stroke(self) -> None:
         if self._stroke_recorder is None:
@@ -554,6 +622,51 @@ class MainWindow(QMainWindow):
         self._model_label.setText(f"模型：{Path(path).name}")
         self.statusBar().showMessage("已选择本地模型", 3000)
 
+    def select_background_dialog(self) -> None:
+        """弹出文件选择框，把选中的本地图片适配为当前文档背景。"""
+        if self.document is None:
+            return
+        start_dir = ""
+        background = self.document.background
+        if background is not None and background.source_path is not None:
+            start_dir = str(background.source_path.parent)
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择背景图片",
+            start_dir,
+            "图片 (*.png *.jpg *.jpeg *.webp)",
+        )
+        if path:
+            self.set_background_path(Path(path))
+
+    def set_background_path(self, path: str | Path) -> bool:
+        """加载本地图片并按覆盖方式适配为当前文档背景。
+
+        返回是否成功，供测试和拖放等调用方判断；失败时保留原背景。
+        """
+        if self.document is None:
+            return False
+        try:
+            image = load_background_image(path)
+        except ImageLoadError as exc:
+            QMessageBox.warning(self, "无法加载背景", str(exc))
+            return False
+        self.document.set_background(image, Path(path))
+        self.canvas.update_image(compose_result(self.document))
+        busy = self._export_thread is not None or self._segmentation_thread is not None
+        self.clear_background_action.setEnabled(not busy)
+        self.statusBar().showMessage(f"已选择背景：{Path(path).name}", 5000)
+        return True
+
+    def clear_background(self) -> None:
+        """清除背景，恢复棋盘格透明预览与透明导出。"""
+        if self.document is None or self.document.background is None:
+            return
+        self.document.clear_background()
+        self.canvas.update_image(compose_result(self.document))
+        self.clear_background_action.setEnabled(False)
+        self.statusBar().showMessage("已清除背景", 3000)
+
     def start_segmentation(self) -> bool:
         """在独立线程中加载模型并对不可变原图副本执行智能抠图。"""
         if self.document is None or self._segmentation_thread is not None or self._export_thread is not None:
@@ -565,8 +678,13 @@ class MainWindow(QMainWindow):
             self._model_label.setText("模型：文件缺失")
             return False
 
+        try:
+            segmenter = self._segmenter_factory(model_path)
+        except ValueError as exc:
+            QMessageBox.warning(self, "模型配置错误", str(exc))
+            self._model_label.setText("模型：配置错误")
+            return False
         token = CancelToken()
-        segmenter = self._segmenter_factory(model_path)
         worker = SegmentationWorker(segmenter, self.document.original_rgba, token)
         thread = QThread(self)
         worker.moveToThread(thread)
@@ -709,8 +827,10 @@ class MainWindow(QMainWindow):
         # 默认文件名沿用源文件名，方便与原图对应
         default_name = "抠图结果.png"
         if self.document.source_path is not None:
-            default_name = f"{self.document.source_path.stem}-抠图.png"
-        path, _ = QFileDialog.getSaveFileName(self, "导出透明 PNG", default_name, "PNG 图片 (*.png)")
+            suffix = "背景合成" if self.document.background is not None else "抠图"
+            default_name = f"{self.document.source_path.stem}-{suffix}.png"
+        title = "导出带背景 PNG" if self.document.background is not None else "导出透明 PNG"
+        path, _ = QFileDialog.getSaveFileName(self, title, default_name, "PNG 图片 (*.png)")
         if path:
             self.start_export(Path(path))
 

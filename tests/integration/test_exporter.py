@@ -86,6 +86,21 @@ def test_export_uses_binary_union_at_original_resolution(tmp_path: Path) -> None
         assert exported.getpixel((2, 1)) == source.getpixel((2, 1))
 
 
+def test_export_with_background_flattens_transparency(tmp_path: Path) -> None:
+    """验证设置背景后导出的是不透明成品图，透明区域由背景填充。"""
+    document = ImageDocument(Image.new("RGBA", (2, 1), (10, 20, 30, 255)))
+    document.erase_mask.putpixel((0, 0), 255)
+    document.set_background(Image.new("RGB", (2, 1), (200, 100, 50)))
+
+    output = export_png(document, tmp_path / "with-background.png")
+
+    with Image.open(output) as exported:
+        exported.load()
+        assert exported.mode == "RGBA"
+        assert exported.getpixel((0, 0)) == (200, 100, 50, 255)
+        assert exported.getpixel((1, 0)) == (10, 20, 30, 255)
+
+
 def test_export_round_trip_preserves_unedited_rgba_pixels(tmp_path: Path) -> None:
     source = Image.new("RGBA", (3, 1))
     source.putdata([(10, 20, 30, 17), (40, 50, 60, 128), (70, 80, 90, 255)])

@@ -71,6 +71,27 @@ def test_point_pick_hover_and_brush_mode_are_separate(qtbot, tmp_path: Path) -> 
     assert window.document.erase_mask.getpixel((90, 20)) > 0
 
 
+def test_pointer_leave_clears_hover_color(qtbot, tmp_path: Path) -> None:
+    """指针移出画布后悬停色块应清空，不能残留上一个像素的颜色。"""
+    window = _color_window(qtbot, tmp_path, Image.new("RGBA", (120, 80), (200, 100, 50, 255)))
+    point = _viewport_point(window, 20.5, 20.5)
+    hover_event = QMouseEvent(
+        QEvent.Type.MouseMove,
+        QPointF(point),
+        QPointF(window.canvas.viewport().mapToGlobal(point)),
+        Qt.MouseButton.NoButton,
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    QApplication.sendEvent(window.canvas.viewport(), hover_event)
+    assert window.color_panel.hover_swatch.property("rgb") == (200, 100, 50)
+
+    # 指针移出画布时 Leave 送到 viewport，画布应据此清空悬停信息
+    QApplication.sendEvent(window.canvas.viewport(), QEvent(QEvent.Type.Leave))
+    assert window.color_panel.hover_swatch.property("rgb") is None
+    assert "将指针移到图片上" in window.color_panel.hover_text.text()
+
+
 def test_drag_region_adds_deduplicated_multiple_colors(qtbot, tmp_path: Path) -> None:
     image = Image.new("RGBA", (160, 100), (255, 0, 0, 255))
     for x in range(40, 80):

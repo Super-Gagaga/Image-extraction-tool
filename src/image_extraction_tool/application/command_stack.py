@@ -169,22 +169,19 @@ class MaskPatchCommand:
         self.document.mark_edited()
 
 
-class BrushStrokeRecorder:
-    """在一整条笔画期间累计初始矩形，释放时生成单个命令。"""
+@dataclass(slots=True)
+class _MaskSnapshot:
+    """单张蒙版在一次笔画期间的初始状态，矩形随笔画范围扩大。"""
 
-    def __init__(self, document: ImageDocument, mask_name: str, description: str) -> None:
-        self.document = document
-        self.mask_name = mask_name
-        self.description = description
-        self.bbox: BoundingBox | None = None
-        self._before: Image.Image | None = None
+    mask_name: str
+    bbox: BoundingBox | None = None
+    image: Image.Image | None = None
 
-    def include_before(self, bbox: BoundingBox) -> None:
-        """在当前画段写入前扩展初始状态快照。"""
-        target = getattr(self.document, self.mask_name)
+    def include(self, target: Image.Image, bbox: BoundingBox) -> None:
+        """记下 ``bbox`` 内的初始像素；矩形扩大时保留已记录的部分。"""
         if self.bbox is None:
             self.bbox = bbox
-            self._before = target.crop(bbox)
+            self.image = target.crop(bbox)
             return
         union = (
             min(self.bbox[0], bbox[0]),
@@ -195,34 +192,92 @@ class BrushStrokeRecorder:
         if union == self.bbox:
             return
         expanded = target.crop(union)
-        assert self._before is not None
-        expanded.paste(self._before, (self.bbox[0] - union[0], self.bbox[1] - union[1]))
+        assert self.image is not None
+        expanded.paste(self.image, (self.bbox[0] - union[0], self.bbox[1] - union[1]))
         self.bbox = union
-        self._before = expanded
+        self.image = expanded
 
-    def finish(self) -> MaskPatchCommand | None:
-        if self.bbox is None or self._before is None:
+    def restore(self, target: Image.Image) -> bool:
+        """把记录的初始像素写回蒙版；尚未记录过任何区域时返回 False。"""
+        if self.bbox is None or self.image is None:
+            return False
+        target.paste(self.image, self.bbox[:2])
+        return True
+
+    def command(self, document: ImageDocument, description: str) -> MaskPatchCommand | None:
+        """生成这层蒙版的前后差异命令；像素没有变化时返回 None。"""
+        if self.bbox is None or self.image is None:
             return None
-        target = getattr(self.document, self.mask_name)
-        after = target.crop(self.bbox)
-        if after.tobytes() == self._before.tobytes():
+        after = getattr(document, self.mask_name).crop(self.bbox)
+        if after.tobytes() == self.image.tobytes():
             return None
         return MaskPatchCommand.from_images(
-            self.document,
+            document,
             self.mask_name,
             self.bbox,
-            self._before,
+            self.image,
             after,
-            description=self.description,
+            description=description,
         )
 
+
+class BrushStrokeRecorder:
+    """在一整条笔画期间累计初始矩形，释放时生成单个命令。
+
+    一次画笔只往一张蒙版写入强度，但会清除对方蒙版上的同一批像素，两张蒙版
+    都可能变化，因此这里为每张受影响的蒙版各记录一份前状态，并在结束时可把
+    它们组合成同一个历史步骤。
+    """
+
+    def __init__(
+        self,
+        document: ImageDocument,
+        mask_name: str,
+        description: str,
+        *,
+        opposite_mask_name: str | None = None,
+    ) -> None:
+        self.document = document
+        self.description = description
+        # 第一项是落笔写入的蒙版，其余是需要同步清除的对方蒙版
+        mask_names = (mask_name, opposite_mask_name) if opposite_mask_name else (mask_name,)
+        self._snapshots = [_MaskSnapshot(name) for name in mask_names]
+
+    @property
+    def mask_name(self) -> str:
+        """落笔写入的蒙版名。"""
+        return self._snapshots[0].mask_name
+
+    @property
+    def bbox(self) -> BoundingBox | None:
+        """已记录的累积矩形，尚未落笔时为 None。"""
+        return self._snapshots[0].bbox
+
+    def include_before(self, bbox: BoundingBox) -> None:
+        """在当前画段写入前扩展各张蒙版的初始状态快照。"""
+        for snapshot in self._snapshots:
+            snapshot.include(getattr(self.document, snapshot.mask_name), bbox)
+
+    def finish(self) -> HistoryCommand | None:
+        commands = tuple(
+            command
+            for snapshot in self._snapshots
+            if (command := snapshot.command(self.document, self.description)) is not None
+        )
+        if not commands:
+            return None
+        if len(commands) == 1:
+            return commands[0]
+        return CompoundCommand(commands, self.description)
+
     def cancel(self) -> bool:
-        if self.bbox is None or self._before is None:
-            return False
-        target = getattr(self.document, self.mask_name)
-        target.paste(self._before, self.bbox[:2])
-        self.document.mark_edited()
-        return True
+        """恢复笔画前的全部蒙版状态，返回是否有蒙版被还原。"""
+        restored = False
+        for snapshot in self._snapshots:
+            restored |= snapshot.restore(getattr(self.document, snapshot.mask_name))
+        if restored:
+            self.document.mark_edited()
+        return restored
 
 
 @dataclass(slots=True)

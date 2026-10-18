@@ -6,7 +6,7 @@ import pytest
 from PIL import Image
 
 from image_extraction_tool.errors import ImageLoadError
-from image_extraction_tool.infrastructure.image_io import load_image
+from image_extraction_tool.infrastructure.image_io import load_background_image, load_image
 
 
 @pytest.mark.parametrize("suffix", [".png", ".jpg", ".jpeg", ".webp"])
@@ -80,3 +80,22 @@ def test_unsupported_extension_is_rejected(tmp_path: Path) -> None:
 def test_missing_file_is_reported(tmp_path: Path) -> None:
     with pytest.raises(ImageLoadError, match="找不到图片"):
         load_image(tmp_path / "missing.png")
+
+
+def test_load_background_image_returns_rgba_without_creating_document(tmp_path: Path) -> None:
+    path = tmp_path / "background.png"
+    Image.new("RGB", (4, 3), (12, 34, 56)).save(path)
+
+    image = load_background_image(path)
+
+    assert image.mode == "RGBA"
+    assert image.size == (4, 3)
+    assert image.getpixel((0, 0)) == (12, 34, 56, 255)
+
+
+def test_broken_background_image_is_reported(tmp_path: Path) -> None:
+    path = tmp_path / "broken.png"
+    path.write_bytes(b"not an image")
+
+    with pytest.raises(ImageLoadError, match="损坏"):
+        load_background_image(path)

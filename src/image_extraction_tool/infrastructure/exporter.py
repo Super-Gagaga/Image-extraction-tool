@@ -1,4 +1,4 @@
-"""透明 PNG 的全尺寸、安全写入实现。"""
+"""PNG 的全尺寸、安全写入实现（透明输出或带背景成品图）。"""
 
 from __future__ import annotations
 
@@ -12,7 +12,10 @@ from image_extraction_tool.errors import ExportError
 
 
 def export_png(document: ImageDocument, destination: str | Path) -> Path:
-    """从原图和全尺寸蒙版重新合成，并以原子替换方式写出 RGBA PNG。"""
+    """从原图、全尺寸蒙版和可选背景重新合成，并以原子替换方式写出 PNG。
+
+    未设置背景时保留透明通道；设置了背景时输出叠加后的成品图。
+    """
     path = Path(destination)
     # 后缀不是 .png 时自动补全，避免用户漏写扩展名而保存出无后缀文件
     if path.suffix.lower() != ".png":

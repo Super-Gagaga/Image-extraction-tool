@@ -9,6 +9,7 @@ from pathlib import Path
 
 from PIL import Image
 
+from image_extraction_tool.domain.background import Background, fit_background
 from image_extraction_tool.domain.color_selection import SelectedColor
 
 
@@ -46,6 +47,10 @@ class ImageDocument:
     原始图像以私有属性保存，调用方拿到的是副本，避免预览或编辑代码
     意外改写文档的原始像素。四张蒙版均为与原图等大的 8 位灰度图：
     ai_mask/color_mask 用 255 表示保留、erase_mask/restore_mask 用 255 表示要处理。
+
+    erase_mask 与 restore_mask 在落笔层面互斥：写入一张时会清除另一张上的
+    同一批像素，因此同一像素最多只留在一张画笔蒙版上，最后落笔的那支画笔
+    决定结果。两张蒙版都全 0 表示“没有任何手工修改”。
     """
 
     def __init__(self, original_rgba: Image.Image, source_path: Path | None = None) -> None:
@@ -64,7 +69,9 @@ class ImageDocument:
         self.restore_mask = Image.new("L", self._original_rgba.size, 0)
         self.selected_colors: list[SelectedColor] = []
         self.color_tolerance = 30
-        # 每次修改蒙版后自增，供 UI 判断是否需要重绘缓存
+        # 已适配到原图尺寸的背景图；None 表示保持透明背景
+        self.background: Background | None = None
+        # 每次修改蒙版或背景后自增，供 UI 判断是否需要重绘缓存
         self.revision = 0
 
     @property
@@ -115,4 +122,16 @@ class ImageDocument:
 
     def mark_edited(self) -> None:
         """记录一次影响合成结果的蒙版修改（revision 自增，供 UI 失效缓存）。"""
+        self.revision += 1
+
+    def set_background(self, image: Image.Image, source_path: Path | None = None) -> None:
+        """把本地图片按覆盖方式适配到原图尺寸，作为当前合成背景。"""
+        self.background = Background(fit_background(image, self.size), source_path)
+        self.revision += 1
+
+    def clear_background(self) -> None:
+        """移除合成背景，恢复透明输出；没有背景时保持幂等。"""
+        if self.background is None:
+            return
+        self.background = None
         self.revision += 1

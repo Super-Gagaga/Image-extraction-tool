@@ -114,6 +114,30 @@ class OnnxU2NetSegmenter:
                 self._session_cache.popitem(last=False)
             self._session = session
 
+    def describe(self) -> dict[str, object]:
+        """返回模型输入输出描述，供自检脚本和界面诊断使用。
+
+        未加载模型时会先加载；固定尺寸模型返回其声明尺寸，动态尺寸模型
+        返回本实例配置的推理尺寸。
+        """
+        if self._session is None:
+            self.load()
+        assert self._session is not None
+        inputs = self._session.get_inputs()
+        outputs = self._session.get_outputs()
+        shape = inputs[0].shape
+        dynamic = not (
+            isinstance(shape[2], int) and shape[2] > 0 and isinstance(shape[3], int) and shape[3] > 0
+        )
+        width, height = self._input_size()
+        return {
+            "input_name": inputs[0].name,
+            "input_shape": list(shape),
+            "dynamic": dynamic,
+            "input_size": (width, height),
+            "outputs": [{"name": output.name, "shape": list(output.shape)} for output in outputs],
+        }
+
     def predict(
         self,
         image: Image.Image,

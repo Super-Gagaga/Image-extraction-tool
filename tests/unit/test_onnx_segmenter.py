@@ -22,14 +22,24 @@ class _Input:
         self.shape = shape
 
 
+class _Output:
+    def __init__(self, shape) -> None:
+        self.name = "output"
+        self.shape = shape
+
+
 class _Session:
     def __init__(self, output: np.ndarray, shape=(1, 3, 2, 2)) -> None:
         self.output = output
         self.input = _Input(shape)
+        self.outputs = [_Output(output.shape)]
         self.feed: dict[str, np.ndarray] | None = None
 
     def get_inputs(self):
         return [self.input]
+
+    def get_outputs(self):
+        return self.outputs
 
     def run(self, _output_names, feed):
         self.feed = feed
@@ -39,6 +49,35 @@ class _Session:
 @pytest.fixture(autouse=True)
 def _clear_cache() -> None:
     OnnxU2NetSegmenter.clear_session_cache()
+
+
+def test_describe_reports_fixed_and_dynamic_input_sizes(monkeypatch, tmp_path: Path) -> None:
+    fixed_model = tmp_path / "fixed.onnx"
+    fixed_model.write_bytes(b"mock fixed")
+    fixed_session = _Session(np.ones((1, 1, 2, 2), dtype=np.float32), shape=(1, 3, 2, 2))
+    monkeypatch.setattr(
+        "image_extraction_tool.infrastructure.segmenters.onnx_u2net.ort.InferenceSession",
+        lambda *_args, **_kwargs: fixed_session,
+    )
+
+    fixed_info = OnnxU2NetSegmenter(fixed_model).describe()
+
+    assert fixed_info["dynamic"] is False
+    assert fixed_info["input_size"] == (2, 2)
+    assert fixed_info["outputs"] == [{"name": "output", "shape": [1, 1, 2, 2]}]
+
+    dynamic_model = tmp_path / "dynamic.onnx"
+    dynamic_model.write_bytes(b"mock dynamic")
+    dynamic_session = _Session(np.ones((1, 1, 5, 7), dtype=np.float32), shape=(1, 3, "height", "width"))
+    monkeypatch.setattr(
+        "image_extraction_tool.infrastructure.segmenters.onnx_u2net.ort.InferenceSession",
+        lambda *_args, **_kwargs: dynamic_session,
+    )
+
+    dynamic_info = OnnxU2NetSegmenter(dynamic_model, dynamic_input_size=(1024, 1024)).describe()
+
+    assert dynamic_info["dynamic"] is True
+    assert dynamic_info["input_size"] == (1024, 1024)
 
 
 def test_preprocess_and_output_restore_keep_size_mode_and_direction(monkeypatch, tmp_path: Path) -> None:

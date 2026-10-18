@@ -10,6 +10,7 @@ from PySide6.QtGui import (
     QImage,
     QMouseEvent,
     QPainter,
+    QPen,
     QPixmap,
     QWheelEvent,
 )
@@ -22,6 +23,10 @@ from image_extraction_tool.domain.document import ToolType
 # 缩放上下限，避免极端缩放下出现数值问题
 MIN_SCALE = 0.02
 MAX_SCALE = 64.0
+
+# 画笔光标在屏幕上的最小显示半径（设备像素）。真实半径更小时只放大显示，
+# 否则 1px 画笔在“适应窗口”的缩放下会小到看不见，用户无法判断落笔位置。
+MIN_CURSOR_RADIUS_PX = 2.0
 
 
 def pil_to_qimage(image: Image.Image) -> QImage:
@@ -39,6 +44,7 @@ def pil_to_qimage(image: Image.Image) -> QImage:
 
 
 class CanvasView(QGraphicsView):
+
     """场景坐标即原图像素坐标的图片视图。"""
 
     zoom_changed = Signal(float)
@@ -71,6 +77,12 @@ class CanvasView(QGraphicsView):
         self._selecting_color = False
         self._selection_origin = QPoint()
         self._selection_band = QRubberBand(QRubberBand.Shape.Rectangle, self.viewport())
+        # 画笔作用范围光标：半径为原图像素，中心为原图坐标；仅画笔工具下可见
+        self._brush_radius = 10.0
+        self._brush_cursor_visible = False
+        self._cursor_scene_position: QPointF | None = None
+        # 最近一次鼠标移动的视口位置；工具切换和画笔尺寸变化时据此刷新光标
+        self._last_viewport_position: QPointF | None = None
 
         self.setBackgroundBrush(self._checkerboard_brush())
         self.setFrameShape(QGraphicsView.Shape.NoFrame)
@@ -125,6 +137,98 @@ class CanvasView(QGraphicsView):
         """设置互斥左键工具，并取消尚未结束的旧工具操作。"""
         self.cancel_current_operation()
         self._active_tool = tool
+        # 切换工具时指针通常没有移动，需要主动按当前指针位置刷新光标
+        self._refresh_brush_cursor()
+
+    def set_brush_size(self, size_px: int) -> None:
+        """同步画笔尺寸，使光标圆环与实际落笔范围一致。"""
+        self._brush_radius = max(float(size_px), 1.0) / 2.0
+        self._refresh_brush_cursor()
+
+    @property
+    def brush_cursor_visible(self) -> bool:
+        return self._brush_cursor_visible
+
+    @property
+    def brush_cursor_radius(self) -> float:
+        """光标圆环半径（原图像素），已包含最小可见半径的放大。"""
+        return self._cursor_scene_radius()
+
+    def _cursor_scene_radius(self) -> float:
+        """圆环在原图坐标下的半径；过小时按屏幕最小半径放大显示。"""
+        scale = abs(self.zoom_factor) or 1.0
+        return max(self._brush_radius, MIN_CURSOR_RADIUS_PX / scale)
+
+    def _refresh_brush_cursor(self, viewport_position: QPointF | None = None) -> None:
+        """按当前工具、指针位置与视图状态刷新画笔作用范围光标。
+
+        省略 ``viewport_position`` 时复用最近一次鼠标移动的位置，用于切换工具
+        或调整画笔尺寸这类自身不产生鼠标事件、但需要立刻更新光标的场景。
+        """
+        dirty = self._brush_cursor_dirty_rect()
+        if viewport_position is None:
+            viewport_position = self._last_viewport_position
+        scene_position = None
+        if viewport_position is not None:
+            scene_position = self.mapToScene(viewport_position.toPoint())
+        visible = (
+            self._has_image
+            and self._active_tool in (ToolType.ERASE_BRUSH, ToolType.RESTORE_BRUSH)
+            and not self._panning
+            and viewport_position is not None
+            and self.viewport().rect().contains(viewport_position.toPoint())
+            # 图片外左键不会落笔，圆环只画在实际可编辑的范围内
+            and 0.0 <= scene_position.x() < self._image_item.boundingRect().width()
+            and 0.0 <= scene_position.y() < self._image_item.boundingRect().height()
+        )
+        self._brush_cursor_visible = visible
+        self._cursor_scene_position = scene_position if visible else None
+        # 只重绘圆环经过的区域，避免每次鼠标移动都整屏刷新
+        self._paint_brush_cursor(dirty.united(self._brush_cursor_dirty_rect()))
+
+    def _brush_cursor_dirty_rect(self) -> QRect:
+        """圆环在视口坐标下需要重绘的矩形，不可见时为空矩形。"""
+        if not self._brush_cursor_visible or self._cursor_scene_position is None:
+            return QRect()
+        radius = self._cursor_scene_radius()
+        center = self._cursor_scene_position
+        top_left = self.mapFromScene(center - QPointF(radius, radius))
+        bottom_right = self.mapFromScene(center + QPointF(radius, radius))
+        # 外扩 2px 容纳双色描边的线宽
+        return QRect(top_left, bottom_right).normalized().adjusted(-2, -2, 2, 2)
+
+    def _paint_brush_cursor(self, rect: QRect) -> None:
+        if not rect.isNull():
+            self.viewport().update(rect)
+
+    def drawForeground(self, painter: QPainter, rect: QRectF) -> None:
+        """在图片之上绘制画笔作用范围光标。"""
+        super().drawForeground(painter, rect)
+        if not self._brush_cursor_visible or self._cursor_scene_position is None:
+            return
+        center = self._cursor_scene_position
+        radius = self._cursor_scene_radius()
+        # 深色外环加浅色内环：无论笔刷落在深色主体还是浅色背景上都清晰可辨
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(self._cursor_pen(QColor(0, 0, 0, 180)))
+        painter.drawEllipse(center, radius, radius)
+        # 内环按屏幕像素向内收 1.5px，需要除以缩放倍数换算回原图坐标
+        scale = abs(self.zoom_factor) or 1.0
+        inner_radius = radius - 1.5 / scale
+        if inner_radius > 0.0:
+            painter.setPen(self._cursor_pen(QColor(255, 255, 255, 235)))
+            painter.drawEllipse(center, inner_radius, inner_radius)
+        painter.restore()
+
+    @staticmethod
+    def _cursor_pen(color: QColor) -> QPen:
+        pen = QPen(color)
+        # cosmetic 线宽不随缩放变化，任意倍率下圆环都只占 1 个屏幕像素
+        pen.setCosmetic(True)
+        pen.setWidth(1)
+        return pen
 
     def cancel_current_operation(self) -> None:
         """取消尚未完成的笔画或颜色框选。"""
@@ -210,6 +314,8 @@ class CanvasView(QGraphicsView):
         delta = new_scene_position - old_scene_position
         self.translate(delta.x(), delta.y())
         self._emit_zoom()
+        # 圆环按屏幕最小半径显示，缩放会改变其原图半径，需要重新计算
+        self._refresh_brush_cursor(event.position())
         event.accept()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
@@ -218,6 +324,8 @@ class CanvasView(QGraphicsView):
             self._panning = True
             self._pan_origin = event.position().toPoint()
             self.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
+            # 平移期间画笔不生效，同步隐藏作用范围光标
+            self._refresh_brush_cursor(event.position())
             event.accept()
             return
         if event.button() == Qt.MouseButton.LeftButton and self._has_image and self._active_tool is ToolType.COLOR_PICKER:
@@ -248,6 +356,9 @@ class CanvasView(QGraphicsView):
         """平移时按拖动增量滚动滚动条；绘画时按上一位置到当前位置发出笔迹。"""
         hover_position = self._editable_scene_position(event)
         self.hover_position_changed.emit(hover_position)
+        # 光标圆环跟随指针，先于各分支刷新，平移或绘制中也保持一致
+        self._last_viewport_position = event.position()
+        self._refresh_brush_cursor(event.position())
         if self._panning:
             current = event.position().toPoint()
             delta = current - self._pan_origin
@@ -283,6 +394,8 @@ class CanvasView(QGraphicsView):
         if event.button() == Qt.MouseButton.RightButton and self._panning:
             self._panning = False
             self.viewport().unsetCursor()
+            # 平移结束后按当前指针位置重新显示画笔作用范围
+            self._refresh_brush_cursor(event.position())
             event.accept()
             return
         if event.button() == Qt.MouseButton.LeftButton and self._selecting_color:
@@ -315,7 +428,29 @@ class CanvasView(QGraphicsView):
 
     def leaveEvent(self, event: QEvent) -> None:
         self.hover_position_changed.emit(None)
+        self._hide_brush_cursor()
         super().leaveEvent(event)
+
+    def viewportEvent(self, event: QEvent) -> bool:
+        """指针离开视口时收起画笔光标并清空悬停颜色。
+
+        视口才是真正接收鼠标事件的子控件，指针移出画布时 Leave 会先送到这里，
+        而 QGraphicsView 自身的 leaveEvent 在 Qt6 下并不会收到该事件。保留
+        leaveEvent 只是为了让行为不依赖 Qt 内部的事件投递路径。
+        """
+        if event.type() == QEvent.Type.Leave:
+            self.hover_position_changed.emit(None)
+            self._hide_brush_cursor()
+        return super().viewportEvent(event)
+
+    def _hide_brush_cursor(self) -> None:
+        """隐藏作用范围光标，并清掉最近指针位置，避免它被后续刷新重新唤起。"""
+        self._last_viewport_position = None
+        if not self._brush_cursor_visible and self._cursor_scene_position is None:
+            return
+        self._brush_cursor_visible = False
+        self._cursor_scene_position = None
+        self.viewport().update()
 
     def _emit_zoom(self) -> None:
         """把当前缩放倍数广播给状态栏等订阅者。"""

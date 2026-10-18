@@ -11,7 +11,12 @@ from image_extraction_tool.application.command_stack import (
     CommandStack,
     MaskPatchCommand,
 )
-from image_extraction_tool.domain.brush import BrushSettings, brush_segment_bounds, paint_mask_segment
+from image_extraction_tool.domain.brush import (
+    BrushSettings,
+    brush_segment_bounds,
+    paint_mask_segment,
+    paint_mask_segment_exclusive,
+)
 from image_extraction_tool.domain.document import ImageDocument
 
 
@@ -134,3 +139,65 @@ def test_ai_mask_is_validated_before_atomic_history_commit() -> None:
     assert document.ai_mask.getextrema() == (255, 255)
     assert stack.redo()
     assert document.ai_mask.getextrema() == (64, 64)
+
+
+def test_two_mask_recorder_undoes_and_cancels_both_masks_together() -> None:
+    """一次互斥笔画会同时改动两张蒙版，撤销和取消都必须一并还原。"""
+    document = ImageDocument(Image.new("RGBA", (60, 40), "white"))
+    # 预置一层恢复，模拟“先恢复、再抠除”的场景
+    document.restore_mask.paste(255, (20, 10, 40, 30))
+    settings = BrushSettings(size_px=6)
+    start, end = (30.5, 20.5), (34.5, 20.5)
+
+    recorder = BrushStrokeRecorder(
+        document,
+        "erase_mask",
+        "抠除笔画",
+        opposite_mask_name="restore_mask",
+    )
+    bounds = brush_segment_bounds(document.size, start, end, settings.size_px)
+    assert bounds is not None
+    recorder.include_before(bounds)
+    paint_mask_segment_exclusive(document.erase_mask, document.restore_mask, start, end, settings)
+
+    before_erase = document.erase_mask.tobytes()
+    before_restore = document.restore_mask.tobytes()
+    assert document.erase_mask.getbbox() is not None
+    # 抠除命中的像素必须已经从恢复蒙版清除
+    assert document.restore_mask.getpixel((32, 20)) == 0
+
+    # 一次笔画只产生一个历史步骤，撤销时两张蒙版同时还原
+    command = recorder.finish()
+    assert command is not None
+    stack = CommandStack()
+    stack.push_applied(command)
+    assert stack.undo_count == 1
+    stack.undo()
+    assert document.erase_mask.getextrema() == (0, 0)
+    assert document.restore_mask.getpixel((32, 20)) == 255
+    stack.redo()
+    assert document.erase_mask.tobytes() == before_erase
+    assert document.restore_mask.tobytes() == before_restore
+
+
+def test_two_mask_recorder_cancel_restores_both_masks() -> None:
+    """取消未完成的笔画时，写入侧与清除侧都要回到落笔前状态。"""
+    document = ImageDocument(Image.new("RGBA", (40, 30), "white"))
+    settings = BrushSettings(size_px=5)
+    start, end = (20.5, 15.5), (22.5, 15.5)
+
+    recorder = BrushStrokeRecorder(
+        document,
+        "restore_mask",
+        "恢复笔画",
+        opposite_mask_name="erase_mask",
+    )
+    bounds = brush_segment_bounds(document.size, start, end, settings.size_px)
+    assert bounds is not None
+    recorder.include_before(bounds)
+    paint_mask_segment_exclusive(document.restore_mask, document.erase_mask, start, end, settings)
+    assert document.restore_mask.getbbox() is not None
+
+    assert recorder.cancel()
+    assert document.restore_mask.getextrema() == (0, 0)
+    assert document.erase_mask.getextrema() == (0, 0)

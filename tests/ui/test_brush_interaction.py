@@ -5,9 +5,12 @@ from math import floor
 
 import pytest
 from PIL import Image
-from PySide6.QtCore import QPointF, Qt
+from PySide6.QtCore import QEvent, QPointF, Qt
+from PySide6.QtGui import QMouseEvent
+from PySide6.QtWidgets import QApplication
 
 from image_extraction_tool.domain.compositor import compose_alpha
+from image_extraction_tool.ui.canvas_view import MIN_CURSOR_RADIUS_PX
 from image_extraction_tool.ui.main_window import MainWindow
 
 
@@ -74,6 +77,81 @@ def test_fast_drag_is_interpolated_and_tool_modes_are_exclusive(qtbot, tmp_path:
     assert not window.erase_action.isChecked()
     qtbot.mouseClick(window.canvas.viewport(), Qt.MouseButton.LeftButton, pos=end)
     assert compose_alpha(window.document).getpixel((end_x, row)) == 255
+
+
+def _pixel_at_scene(window: MainWindow, scene_position: QPointF) -> tuple[int, int]:
+    """返回点击该原图位置时实际命中的像素坐标。
+
+    ``mapFromScene`` 会把坐标取整回 QPoint，直接按输入坐标取整会差一个像素，
+    因此这里按与画布一致的路径反推真实落笔像素。
+    """
+    viewport_point = window.canvas.mapFromScene(scene_position)
+    mapped = window.canvas.image_position(viewport_point)
+    return floor(mapped.x()), floor(mapped.y())
+
+
+def test_erase_works_again_after_restore_brush(qtbot, tmp_path: Path) -> None:
+    """先恢复、再抠除同一区域，抠除必须仍然生效（回归：恢复层曾永久压住抠除）。"""
+    window = _loaded_window(qtbot, tmp_path)
+    window.canvas.show_actual_size()
+    window.brush_size.setValue(1)
+    scene_position = QPointF(40.5, 30.5)
+    point = window.canvas.mapFromScene(scene_position)
+    pixel = _pixel_at_scene(window, scene_position)
+    assert window.document is not None
+
+    # 1) 抠除一个像素，预览变透明
+    window.erase_action.trigger()
+    qtbot.mouseClick(window.canvas.viewport(), Qt.MouseButton.LeftButton, pos=point)
+    assert window.document.erase_mask.getpixel(pixel) == 255
+    assert compose_alpha(window.document).getpixel(pixel) == 0
+
+    # 2) 用恢复画笔在同一像素上恢复为不透明
+    window.restore_action.trigger()
+    qtbot.mouseClick(window.canvas.viewport(), Qt.MouseButton.LeftButton, pos=point)
+    assert compose_alpha(window.document).getpixel(pixel) == 255
+    # 恢复必须清除该像素上的抠除，两张蒙版不允许同时命中
+    assert window.document.erase_mask.getpixel(pixel) == 0
+
+    # 3) 再次抠除同一像素，预览必须重新变透明
+    window.erase_action.trigger()
+    qtbot.mouseClick(window.canvas.viewport(), Qt.MouseButton.LeftButton, pos=point)
+    assert window.document.restore_mask.getpixel(pixel) == 0
+    assert compose_alpha(window.document).getpixel(pixel) == 0
+
+
+def test_alternating_brush_strokes_undo_as_single_steps(qtbot, tmp_path: Path) -> None:
+    """交替使用两支画笔后逐步撤销，每次都应回到上一支画笔的结果。"""
+    window = _loaded_window(qtbot, tmp_path)
+    window.canvas.show_actual_size()
+    window.brush_size.setValue(1)
+    scene_position = QPointF(40.5, 30.5)
+    point = window.canvas.mapFromScene(scene_position)
+    pixel = _pixel_at_scene(window, scene_position)
+    assert window.document is not None
+
+    window.erase_action.trigger()
+    qtbot.mouseClick(window.canvas.viewport(), Qt.MouseButton.LeftButton, pos=point)
+    window.restore_action.trigger()
+    qtbot.mouseClick(window.canvas.viewport(), Qt.MouseButton.LeftButton, pos=point)
+
+    # 撤销恢复：像素回到被抠除状态
+    window.undo()
+    assert compose_alpha(window.document).getpixel(pixel) == 0
+    assert window.document.restore_mask.getpixel(pixel) == 0
+    assert window.document.erase_mask.getpixel(pixel) == 255
+
+    # 继续撤销抠除：像素回到原图不透明状态
+    window.undo()
+    assert compose_alpha(window.document).getpixel(pixel) == 255
+    assert window.document.erase_mask.getpixel(pixel) == 0
+
+    # 重做两步后应精确回到恢复后的状态
+    window.redo()
+    window.redo()
+    assert window.document.erase_mask.getpixel(pixel) == 0
+    assert window.document.restore_mask.getpixel(pixel) == 255
+    assert compose_alpha(window.document).getpixel(pixel) == 255
 
 
 def test_right_drag_never_paints_and_clear_restores_preview(qtbot, tmp_path: Path) -> None:
@@ -144,3 +222,98 @@ def test_export_runs_in_worker_and_matches_preview(qtbot, tmp_path: Path) -> Non
         assert exported.mode == "RGBA"
         assert exported.size == window.document.size
         assert exported.getchannel("A").tobytes() == compose_alpha(window.document).tobytes()
+
+
+def _hover_at_scene(window: MainWindow, scene_position: QPointF) -> None:
+    """把指针移到指定原图位置并投递一次真实的鼠标移动事件。
+
+    ``QTest.mouseMove`` 不产生带鼠标跟踪的移动事件，而 QGraphicsView 只在
+    收到底层鼠标移动事件时才更新画笔光标，因此这里直接投递 ``QMouseEvent``。
+    """
+    viewport = window.canvas.viewport()
+    position = QPointF(window.canvas.mapFromScene(scene_position))
+    event = QMouseEvent(
+        QEvent.Type.MouseMove,
+        position,
+        position,
+        Qt.MouseButton.NoButton,
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    QApplication.sendEvent(viewport, event)
+
+
+@pytest.mark.parametrize("action_name", ["erase_action", "restore_action"])
+def test_brush_tools_show_size_cursor_following_pointer(qtbot, tmp_path: Path, action_name: str) -> None:
+    """两种画笔在图片内移动时显示作用范围光标，且半径等于画笔半径。"""
+    window = _loaded_window(qtbot, tmp_path)
+    window.brush_size.setValue(40)
+    window.canvas.show_actual_size()
+    getattr(window, action_name).trigger()
+
+    _hover_at_scene(window, QPointF(50.5, 40.5))
+    assert window.canvas.brush_cursor_visible
+    assert window.canvas.brush_cursor_radius == pytest.approx(20.0)
+
+    # 移出图片范围后不显示，避免在空白处误导用户以为仍可落笔
+    _hover_at_scene(window, QPointF(-20.0, 40.5))
+    assert not window.canvas.brush_cursor_visible
+
+
+def test_brush_cursor_tracks_size_changes_and_hides_for_other_tools(qtbot, tmp_path: Path) -> None:
+    """调整画笔尺寸立即改变光标半径；切换到取色工具后光标隐藏。"""
+    window = _loaded_window(qtbot, tmp_path)
+    window.canvas.show_actual_size()
+    window.erase_action.trigger()
+    _hover_at_scene(window, QPointF(50.5, 40.5))
+
+    window.brush_size.setValue(10)
+    assert window.canvas.brush_cursor_radius == pytest.approx(5.0)
+    window.brush_size.setValue(80)
+    assert window.canvas.brush_cursor_radius == pytest.approx(40.0)
+
+    window.color_picker_action.trigger()
+    assert not window.canvas.brush_cursor_visible
+
+    # 切回画笔后无需移动鼠标，也应立即恢复显示
+    window.erase_action.trigger()
+    assert window.canvas.brush_cursor_visible
+
+    # 指针离开画布后圆环消失，且不会用最后位置被尺寸变化重新唤起
+    QApplication.sendEvent(window.canvas.viewport(), QEvent(QEvent.Type.Leave))
+    assert not window.canvas.brush_cursor_visible
+    window.brush_size.setValue(30)
+    assert not window.canvas.brush_cursor_visible
+
+
+def test_tiny_brush_cursor_keeps_visible_minimum_radius(qtbot, tmp_path: Path) -> None:
+    """1px 画笔在小倍率下放大到最小可见半径，放大到高倍率后回归真实尺寸。"""
+    window = _loaded_window(qtbot, tmp_path)
+    window.brush_size.setValue(1)
+    window.erase_action.trigger()
+    window.canvas.show_actual_size()
+
+    # 100% 下 0.5 原图像素不足半个屏幕像素，显示半径被抬到最小可见半径
+    _hover_at_scene(window, QPointF(50.5, 40.5))
+    assert window.canvas.brush_cursor_radius == pytest.approx(MIN_CURSOR_RADIUS_PX)
+
+    # 800% 下真实半径已大于最小可见半径，圆环精确等于 0.5 原图像素
+    window.canvas.resetTransform()
+    window.canvas.scale(8.0, 8.0)
+    _hover_at_scene(window, QPointF(50.5, 40.5))
+    assert window.canvas.brush_cursor_radius == pytest.approx(0.5)
+
+
+def test_brush_cursor_hidden_during_right_button_pan(qtbot, tmp_path: Path) -> None:
+    """右键平移期间画笔不生效，作用范围光标应暂时隐藏。"""
+    window = _loaded_window(qtbot, tmp_path)
+    window.erase_action.trigger()
+    point = window.canvas.mapFromScene(QPointF(50.5, 40.5))
+    _hover_at_scene(window, QPointF(50.5, 40.5))
+    assert window.canvas.brush_cursor_visible
+
+    qtbot.mousePress(window.canvas.viewport(), Qt.MouseButton.RightButton, pos=point)
+    assert not window.canvas.brush_cursor_visible
+
+    qtbot.mouseRelease(window.canvas.viewport(), Qt.MouseButton.RightButton, pos=point)
+    assert window.canvas.brush_cursor_visible

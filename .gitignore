@@ -1,15 +1,47 @@
+# Python 字节码与打包元数据
 __pycache__/
 *.py[cod]
+*$py.class
 *.egg-info/
-.pytest_cache/
-.coverage
-htmlcov/
+.eggs/
+*.egg
+
+# 虚拟环境
 .venv/
 venv/
+env/
+ENV/
+
+# 测试、类型检查与覆盖率产物
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# 构建产物（含 PyInstaller 生成物）
 build/
 dist/
 *.spec
+*.whl
+
+# 本地模型权重
+# 权重体积大且各自许可证不同，不提交到仓库；此目录只保留 README 说明。
+models/*
+!models/README.md
+
+# 运行日志与临时导出
 *.log
+
+# 编辑器与操作系统
 .idea/
 .vscode/
-
+*.swp
+*~
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
